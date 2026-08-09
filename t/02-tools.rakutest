@@ -1,0 +1,466 @@
+use Test;
+use lib 'lib';
+use lib 't/lib';
+use FSTest;
+use MCP::Server;
+use MCP::Server::Tool::FileSystem;
+
+# NB: tool output always uses '/' as its separator, whatever the host platform,
+# so the expected strings below are output format rather than host paths.
+# Everything that touches the disk is built with IO::Path.add.
+
+plan 13;
+
+my $sandbox = make-sandbox('tools');
+END nuke($sandbox);
+
+# Read-only fixture tree, kept away from the tests that mutate the sandbox.
+$sandbox.add('tree').add('sub').add('deep').mkdir;
+$sandbox.add('tree').add('empty').mkdir;
+$sandbox.add('tree').add('alpha.txt').spurt('alpha contents');
+$sandbox.add('tree').add('beta.md').spurt('beta');
+$sandbox.add('tree').add('sub').add('gamma.txt').spurt('gamma');
+$sandbox.add('tree').add('sub').add('deep').add('delta.txt').spurt('delta');
+# Scratch space for the mutating tools.
+$sandbox.add('scratch').mkdir;
+
+sub fs-server(Str :$prefix, Bool:D :$read-only = False) {
+	my $server = MCP::Server.new(:name<fs-tools>);
+	$server.plug: MCP::Server::Tool::FileSystem.new(:root($sandbox), :$read-only),
+		|($prefix.defined ?? (:$prefix) !! ());
+	$server;
+}
+
+subtest 'Prefixing' => {
+	plan 3;
+	is-deeply tool-names(fs-server()),
+		<fs_delete fs_edit fs_glob fs_grep fs_list fs_mkdir fs_move fs_read fs_stat fs_write>.list,
+		'default-prefix namespaces the tools as fs_*';
+	is-deeply tool-names(fs-server(:prefix<box>)),
+		<box_delete box_edit box_glob box_grep box_list box_mkdir box_move box_read box_stat box_write>.list,
+		'Explicit :prefix wins over default-prefix';
+	is-deeply tool-names(fs-server(:prefix(''))),
+		<delete edit glob grep list mkdir move read stat write>.list,
+		'An empty prefix registers bare names';
+};
+
+subtest 'read' => {
+	plan 4;
+	my $server = fs-server();
+	my %response = call-tool($server, 'fs_read', { path => 'tree/alpha.txt' });
+	nok result-errored(%response), 'Reading an existing file succeeds';
+	is result-text(%response), 'alpha contents', 'File contents returned verbatim';
+
+	errors-with $server, 'fs_read', { path => 'tree/nope.txt' },
+		"File not found: 'tree/nope.txt'", 'Missing file is an error result';
+	errors-with $server, 'fs_read', { path => 'tree' },
+		'is a directory', 'Reading a directory is an error result';
+};
+
+subtest 'write' => {
+	plan 6;
+	my $server = fs-server();
+	my %write = call-tool($server, 'fs_write', { path => 'scratch/note.txt', content => 'wrötten' });
+	nok result-errored(%write), 'Writing inside an existing directory succeeds';
+	is result-text(%write), "Wrote 8 bytes to 'scratch/note.txt'", 'Confirmation counts UTF-8 bytes';
+	is $sandbox.add('scratch').add('note.txt').slurp, 'wrötten', 'File landed on disk';
+
+	is result-text(call-tool($server, 'fs_read', { path => 'scratch/note.txt' })), 'wrötten',
+		'Written file reads back through the read tool';
+
+	errors-with $server, 'fs_write', { path => 'scratch/missing/note.txt', content => 'x' },
+		'Parent directory', 'Writing below a nonexistent directory is refused';
+	errors-with $server, 'fs_write', { path => 'tree' },
+		"Missing required parameter 'content'", 'Omitting content is an error result';
+};
+
+subtest 'list' => {
+	plan 5;
+	my $server = fs-server();
+	is-deeply result-text(call-tool($server, 'fs_list', { path => 'tree' })).lines.list,
+		('alpha.txt', 'beta.md', 'empty/', 'sub/'),
+		'Sorted entries with a trailing / on directories';
+
+	is-deeply result-text(call-tool($server, 'fs_list', { path => 'tree/sub' })).lines.list,
+		('deep/', 'gamma.txt'), 'Nested directory listed';
+
+	is result-text(call-tool($server, 'fs_list', { path => 'tree/empty' })), '(empty directory)',
+		'Empty directory reports itself';
+
+	is-deeply result-text(call-tool($server, 'fs_list', { })).lines.list,
+		('scratch/', 'tree/'), 'path defaults to the root';
+
+	errors-with $server, 'fs_list', { path => 'tree/alpha.txt' },
+		'is not a directory', 'Listing a file is an error result';
+};
+
+subtest 'glob' => {
+	plan 7;
+	my $server = fs-server();
+	is-deeply result-text(call-tool($server, 'fs_glob', { pattern => '*.txt', path => 'tree' })).lines.list,
+		('tree/alpha.txt', 'tree/sub/deep/delta.txt', 'tree/sub/gamma.txt'),
+		'Bare pattern matches entry names at any depth, results relative to the root';
+
+	is-deeply result-text(call-tool($server, 'fs_glob', { pattern => 'beta.?d', path => 'tree' })).lines.list,
+		('tree/beta.md',), '? matches exactly one character';
+
+	is-deeply result-text(call-tool($server, 'fs_glob', { pattern => 'sub/*.txt', path => 'tree' })).lines.list,
+		('tree/sub/gamma.txt',),
+		'A pattern with a separator matches relative paths, and * stays inside one segment';
+
+	is-deeply result-text(call-tool($server, 'fs_glob', { pattern => 'sub/*/*.txt', path => 'tree' })).lines.list,
+		('tree/sub/deep/delta.txt',), 'Multi-segment pattern reaches deeper';
+
+	is-deeply result-text(call-tool($server, 'fs_glob', { pattern => '*.txt', path => 'tree/sub' })).lines.list,
+		('tree/sub/deep/delta.txt', 'tree/sub/gamma.txt'),
+		'Searching a subdirectory still reports paths relative to the root';
+
+	is result-text(call-tool($server, 'fs_glob', { pattern => '*.zzz', path => 'tree' })),
+		"No matches for '*.zzz' under 'tree'", 'No matches says so';
+
+	is result-text(call-tool($server, 'fs_glob', { pattern => '.*', path => 'tree' })),
+		"No matches for '.*' under 'tree'",
+		'Patterns are globs, not regexes: .* matches nothing here';
+};
+
+subtest 'stat' => {
+	plan 6;
+	my $server = fs-server();
+	my %stat = result-text(call-tool($server, 'fs_stat', { path => 'tree/alpha.txt' }))
+		.lines.map({ .split(': ', 2) }).map({ .[0] => .[1] }).Hash;
+	is %stat<path>, 'tree/alpha.txt', 'Reports the path relative to the root';
+	is %stat<type>, 'file', 'File type';
+	is %stat<size>, '14', 'Byte size';
+	ok %stat<modified> ~~ /^ \d**4 '-' \d\d '-' \d\d 'T' \d\d ':' \d\d ':' \d\d 'Z' $/,
+		'Modification time is ISO 8601 UTC';
+	is %stat<readable>, 'yes', 'Readable flag';
+
+	is result-text(call-tool($server, 'fs_stat', { path => 'tree' })).lines.first(*.starts-with('type')),
+		'type: directory', 'Directories are reported as such';
+};
+
+subtest 'stat under read-only' => {
+	plan 3;
+	my $server = fs-server(:read-only);
+	my $text = result-text(call-tool($server, 'fs_stat', { path => 'tree/alpha.txt' }));
+	ok $text.contains('writable: no'), 'Nothing is writable through a read-only pack';
+	ok $text.contains('readable: yes'), 'Reads are still advertised';
+	errors-with $server, 'fs_stat', { path => 'tree/nope.txt' },
+		"Path not found: 'tree/nope.txt'", 'Missing path is an error result';
+};
+
+subtest 'mkdir' => {
+	plan 5;
+	my $server = fs-server();
+	my %made = call-tool($server, 'fs_mkdir', { path => 'scratch/a/b/c' });
+	nok result-errored(%made), 'Creating a nested directory succeeds';
+	is result-text(%made), "Created directory 'scratch/a/b/c'", 'Confirmation names the path';
+	ok $sandbox.add('scratch').add('a').add('b').add('c').d, 'Parents created too';
+
+	is result-text(call-tool($server, 'fs_mkdir', { path => 'scratch/a/b/c' })),
+		"Directory already exists: 'scratch/a/b/c'", 'Creating it again is a no-op, not an error';
+
+	errors-with $server, 'fs_mkdir', { path => 'tree/alpha.txt' },
+		'already exists and is not a directory', 'A file in the way is an error result';
+};
+
+# The subtests below build their own fixtures under scratch/ rather than in the
+# shared tree, so the exact listings and glob results asserted above keep
+# meaning what they say.
+
+subtest 'read with offset and limit' => {
+	plan 12;
+	my $server = fs-server();
+	my $dir = $sandbox.add('scratch').add('range');
+	$dir.mkdir;
+	$dir.add('lines.txt').spurt("one\ntwo\nthree\nfour\nfive\n");
+
+	# The regression pin: with neither parameter, the tool must still hand back
+	# the file and nothing else — no numbering, no footer, trailing newline intact.
+	is result-text(call-tool($server, 'fs_read', { path => 'scratch/range/lines.txt' })),
+		"one\ntwo\nthree\nfour\nfive\n", 'Omitting offset and limit returns the file unchanged';
+
+	is result-text(call-tool($server, 'fs_read', { path => 'scratch/range/lines.txt', offset => 2, limit => 2 })),
+		"2\ttwo\n3\tthree\n\n[lines 2-3 of 5 total]",
+		'A window is numbered, tab-separated, and footed with its place in the file';
+
+	is result-text(call-tool($server, 'fs_read', { path => 'scratch/range/lines.txt', offset => 4 })),
+		"4\tfour\n5\tfive\n\n[lines 4-5 of 5 total]", 'offset alone reads to the end';
+
+	is result-text(call-tool($server, 'fs_read', { path => 'scratch/range/lines.txt', limit => 1 })),
+		"1\tone\n\n[lines 1-1 of 5 total]", 'limit alone starts at the first line';
+
+	is result-text(call-tool($server, 'fs_read', { path => 'scratch/range/lines.txt', offset => 5, limit => 99 })),
+		"5\tfive\n\n[lines 5-5 of 5 total]", 'A limit running past the end simply stops there';
+
+	my %past = call-tool($server, 'fs_read', { path => 'scratch/range/lines.txt', offset => 6 });
+	nok result-errored(%past), 'Reading past the end is an answer, not an error';
+	is result-text(%past), "'scratch/range/lines.txt' has 5 lines; offset 6 is past the end",
+		'And says where the end is';
+
+	is result-text(call-tool($server, 'fs_read', { path => 'scratch/range/lines.txt', offset => '3' })),
+		"3\tthree\n4\tfour\n5\tfive\n\n[lines 3-5 of 5 total]",
+		'A number sent as a string is accepted';
+
+	errors-with $server, 'fs_read', { path => 'scratch/range/lines.txt', offset => 0 },
+		"Parameter 'offset' must be at least 1", 'A zero offset is an error result';
+	errors-with $server, 'fs_read', { path => 'scratch/range/lines.txt', limit => 0 },
+		"Parameter 'limit' must be at least 1", 'A zero limit is an error result';
+	errors-with $server, 'fs_read', { path => 'scratch/range/lines.txt', offset => 'two' },
+		"Parameter 'offset' must be a whole number", 'A non-numeric offset is an error result';
+	# Bool does Int in Raku, so this one has to be refused on purpose.
+	errors-with $server, 'fs_read', { path => 'scratch/range/lines.txt', limit => True },
+		"Parameter 'limit' must be a whole number, not a boolean",
+		'A boolean is not quietly read as the number 1';
+};
+
+subtest 'edit' => {
+	plan 13;
+	my $server = fs-server();
+	my $dir = $sandbox.add('scratch').add('edit');
+	$dir.mkdir;
+
+	my $poem = $dir.add('poem.txt');
+	$poem.spurt("roses are red\nviolets are blue\nroses are red\n");
+
+	my %once = call-tool($server, 'fs_edit', {
+		path         => 'scratch/edit/poem.txt',
+		'old-string' => 'violets are blue',
+		'new-string' => 'violets are indigo',
+	});
+	nok result-errored(%once), 'Replacing a unique string succeeds';
+	is result-text(%once), "Replaced 1 occurrence in 'scratch/edit/poem.txt'; wrote 47 bytes",
+		'Confirmation counts occurrences and bytes, like write does';
+	is $poem.slurp(:bin).decode('utf-8'),
+		"roses are red\nviolets are indigo\nroses are red\n", 'The change landed on disk';
+	is result-text(call-tool($server, 'fs_read', { path => 'scratch/edit/poem.txt' })),
+		"roses are red\nviolets are indigo\nroses are red\n",
+		'And reads back through the read tool';
+
+	errors-with $server, 'fs_edit',
+		{ path => 'scratch/edit/poem.txt', 'old-string' => 'roses are red', 'new-string' => 'roses are pink' },
+		"Found 2 occurrences of 'old-string'", 'An ambiguous match is refused, naming the count';
+
+	my %all = call-tool($server, 'fs_edit', {
+		path          => 'scratch/edit/poem.txt',
+		'old-string'  => 'roses are red',
+		'new-string'  => 'roses are pink',
+		'replace-all' => True,
+	});
+	is result-text(%all), "Replaced 2 occurrences in 'scratch/edit/poem.txt'; wrote 49 bytes",
+		'replace-all takes every occurrence';
+	is $poem.slurp(:bin).decode('utf-8'),
+		"roses are pink\nviolets are indigo\nroses are pink\n", 'Both occurrences changed on disk';
+
+	errors-with $server, 'fs_edit',
+		{ path => 'scratch/edit/poem.txt', 'old-string' => 'tulips', 'new-string' => 'x' },
+		"No occurrence of 'old-string'", 'A string that is not there is refused';
+	errors-with $server, 'fs_edit',
+		{ path => 'scratch/edit/poem.txt', 'old-string' => '', 'new-string' => 'x' },
+		"Parameter 'old-string' must not be empty", 'An empty old-string is refused';
+	errors-with $server, 'fs_edit',
+		{ path => 'scratch/edit/poem.txt', 'old-string' => 'roses', 'new-string' => 'roses' },
+		'are identical', 'A no-op edit is refused';
+	errors-with $server, 'fs_edit',
+		{ path => 'scratch/edit/nope.txt', 'old-string' => 'a', 'new-string' => 'b' },
+		"File not found: 'scratch/edit/nope.txt'", 'A missing file is an error result';
+	errors-with $server, 'fs_edit',
+		{ path => 'scratch/edit', 'old-string' => 'a', 'new-string' => 'b' },
+		'is a directory', 'A directory is an error result';
+
+	# The whole reason the pack reads bytes rather than text: a text-mode slurp
+	# folds CRLF into LF and a text-mode spurt never puts it back, so every
+	# untouched line of this file would come back rewritten.
+	my $crlf = $dir.add('crlf.txt');
+	$crlf.spurt("alpha\r\nbeta\r\ngamma\r\n".encode('utf-8'));
+	call-tool($server, 'fs_edit', {
+		path => 'scratch/edit/crlf.txt', 'old-string' => 'beta', 'new-string' => 'BETA',
+	});
+	is-deeply $crlf.slurp(:bin).list, "alpha\r\nBETA\r\ngamma\r\n".encode('utf-8').list,
+		'Editing one line of a CRLF file leaves every byte of the others alone';
+};
+
+subtest 'grep' => {
+	plan 16;
+	my $server = fs-server();
+	my $dir = $sandbox.add('scratch').add('grep');
+	$dir.add('sub').mkdir;
+	$dir.add('a.txt').spurt("alpha one\nbeta two\ngamma three\ndelta four\nalpha five\nepsilon six\n");
+	$dir.add('notes.md').spurt("Alpha heading\nnothing here\n");
+	$dir.add('sub').add('b.raku').spurt(qq:to/RAKU/);
+		say "alpha";
+		# beta
+		sub gamma \{ }
+		RAKU
+
+	is-deeply result-text(call-tool($server, 'fs_grep', { pattern => 'alpha', path => 'scratch/grep' })).lines.list,
+		(
+			'scratch/grep/a.txt:1:alpha one',
+			'scratch/grep/a.txt:5:alpha five',
+			'scratch/grep/sub/b.raku:1:say "alpha";',
+		),
+		'Literal matches are reported as path:line:text, deepest last, in walk order';
+
+	is result-text(call-tool($server, 'fs_grep', { pattern => 'al.ha', path => 'scratch/grep' })),
+		"No matches for 'al.ha' under 'scratch/grep'",
+		'Without regex the pattern is literal text, so "." is a full stop';
+
+	is-deeply result-text(call-tool($server, 'fs_grep',
+		{ pattern => 'al.ha', path => 'scratch/grep', regex => True })).lines.list,
+		(
+			'scratch/grep/a.txt:1:alpha one',
+			'scratch/grep/a.txt:5:alpha five',
+			'scratch/grep/sub/b.raku:1:say "alpha";',
+		),
+		'With regex the same pattern is a Raku regex';
+
+	is-deeply result-text(call-tool($server, 'fs_grep',
+		{ pattern => '^ alpha', path => 'scratch/grep', regex => True })).lines.list,
+		('scratch/grep/a.txt:1:alpha one', 'scratch/grep/a.txt:5:alpha five'),
+		'Raku regex syntax works: an anchor, and whitespace that is not literal';
+
+	is-deeply result-text(call-tool($server, 'fs_grep',
+		{ pattern => 'alpha', path => 'scratch/grep', glob => '*.raku' })).lines.list,
+		('scratch/grep/sub/b.raku:1:say "alpha";', ), 'glob filters by file name at any depth';
+
+	is-deeply result-text(call-tool($server, 'fs_grep',
+		{ pattern => 'alpha', path => 'scratch/grep/a.txt', context => 1 })).lines.list,
+		(
+			'scratch/grep/a.txt:1:alpha one',
+			'scratch/grep/a.txt-2-beta two',
+			'--',
+			'scratch/grep/a.txt-4-delta four',
+			'scratch/grep/a.txt:5:alpha five',
+			'scratch/grep/a.txt-6-epsilon six',
+		),
+		'context shows surrounding lines with a - separator and -- between groups';
+
+	is result-text(call-tool($server, 'fs_grep',
+		{ pattern => 'alpha', path => 'scratch/grep', 'max-results' => 1 })),
+		"scratch/grep/a.txt:1:alpha one\n\n[stopped at 1 matching line; raise max-results to see more]",
+		'max-results truncates deterministically and says so';
+
+	is result-text(call-tool($server, 'fs_grep', { pattern => 'zzz', path => 'scratch/grep' })),
+		"No matches for 'zzz' under 'scratch/grep'", 'No matches says so, the way glob does';
+
+	# Binary and mis-encoded files are skipped rather than sprayed across the
+	# answer, and the count says how many were passed over.
+	my $bindir = $sandbox.add('scratch').add('grep-bin');
+	$bindir.mkdir;
+	$bindir.add('ok.txt').spurt("alpha in text\n");
+	$bindir.add('image.dat').spurt(Buf.new(0x89, 0x50, 0x00, 0x01, 0x61, 0x6c, 0x70, 0x68, 0x61));
+	$bindir.add('latin.txt').spurt(Buf.new(0xff, 0xe9, 0x0a));
+	is result-text(call-tool($server, 'fs_grep', { pattern => 'alpha', path => 'scratch/grep-bin' })),
+		"scratch/grep-bin/ok.txt:1:alpha in text\n\n[skipped 2 files that are not UTF-8 text]",
+		'A NUL-bearing file and a non-UTF-8 file are both skipped and counted';
+
+	errors-with $server, 'fs_grep', { pattern => 'a(b', path => 'scratch/grep', regex => True },
+		"Invalid regex pattern 'a(b'", 'A malformed regex is a clean error, not a crash';
+
+	# Interpolating a client string into a regex is only safe because Rakudo
+	# refuses to interpolate one carrying a code block.  This test is the guard
+	# on that guard: it fails the moment anyone adds MONKEY-SEE-NO-EVAL here.
+	errors-with $server, 'fs_grep',
+		{ pattern => '{ unlink "/tmp/pwned" }', path => 'scratch/grep', regex => True },
+		'Prohibited regex interpolation', 'A pattern carrying code is refused outright';
+
+	errors-with $server, 'fs_grep', { pattern => 'alpha', path => 'scratch/grep', glob => 'sub/*.raku' },
+		'may not contain a separator', 'A glob with a path separator is refused';
+	errors-with $server, 'fs_grep', { pattern => '', path => 'scratch/grep' },
+		'Pattern must not be empty', 'An empty pattern is refused';
+	errors-with $server, 'fs_grep', { pattern => 'alpha', path => 'scratch/grep', context => 99 },
+		"Parameter 'context' must be at most 20", 'context is capped';
+	errors-with $server, 'fs_grep', { pattern => 'alpha', path => 'scratch/grep', 'max-results' => 5000 },
+		"Parameter 'max-results' must be at most 1000", 'max-results is capped';
+	errors-with $server, 'fs_grep', { pattern => 'alpha', path => 'scratch/nope' },
+		"Path not found: 'scratch/nope'", 'A missing path is an error result';
+};
+
+subtest 'move' => {
+	plan 14;
+	my $server = fs-server();
+	my $dir = $sandbox.add('scratch').add('move');
+	$dir.mkdir;
+	$dir.add('dest').mkdir;
+	$dir.add('a.txt').spurt('contents of a');
+
+	my %renamed = call-tool($server, 'fs_move',
+		{ from => 'scratch/move/a.txt', to => 'scratch/move/b.txt' });
+	nok result-errored(%renamed), 'Renaming a file succeeds';
+	is result-text(%renamed), "Moved 'scratch/move/a.txt' to 'scratch/move/b.txt'",
+		'Confirmation names both ends';
+	nok $dir.add('a.txt').e, 'The old name is gone';
+	is $dir.add('b.txt').slurp, 'contents of a', 'The contents came with it';
+
+	my %into = call-tool($server, 'fs_move',
+		{ from => 'scratch/move/b.txt', to => 'scratch/move/dest/b.txt' });
+	nok result-errored(%into), 'Moving into an existing directory succeeds';
+	is $dir.add('dest').add('b.txt').slurp, 'contents of a', 'And lands inside it';
+
+	$dir.add('branch').mkdir;
+	$dir.add('branch').add('leaf.txt').spurt('leaf');
+	my %dir-move = call-tool($server, 'fs_move',
+		{ from => 'scratch/move/branch', to => 'scratch/move/twig' });
+	nok result-errored(%dir-move), 'Moving a directory succeeds';
+	is $dir.add('twig').add('leaf.txt').slurp, 'leaf', 'Its contents moved with it';
+	nok $dir.add('branch').e, 'And the old directory is gone';
+
+	errors-with $server, 'fs_move', { from => 'scratch/move/twig/leaf.txt', to => 'scratch/move/dest/b.txt' },
+		"Destination 'scratch/move/dest/b.txt' already exists", 'An existing file is never overwritten';
+	errors-with $server, 'fs_move', { from => 'scratch/move/twig/leaf.txt', to => 'scratch/move/dest' },
+		"Destination 'scratch/move/dest' already exists", 'An existing directory is never overwritten';
+	errors-with $server, 'fs_move', { from => 'scratch/move/twig/leaf.txt', to => 'scratch/move/nope/leaf.txt' },
+		'Parent directory', 'A missing destination parent is refused, as with write';
+	errors-with $server, 'fs_move', { from => 'scratch/move/ghost.txt', to => 'scratch/move/x.txt' },
+		"Path not found: 'scratch/move/ghost.txt'", 'A missing source is an error result';
+	errors-with $server, 'fs_move', { from => '.', to => 'scratch/move/root' },
+		'Refusing to move the server root itself', 'The root cannot be moved out from under the server';
+};
+
+subtest 'delete' => {
+	plan 13;
+	my $server = fs-server();
+	my $dir = $sandbox.add('scratch').add('delete');
+	$dir.mkdir;
+	$dir.add('gone.txt').spurt('bye');
+	$dir.add('hollow').mkdir;
+	$dir.add('full').add('nested').mkdir;
+	$dir.add('full').add('keep.txt').spurt('keep');
+	$dir.add('full').add('nested').add('deep.txt').spurt('deep');
+
+	my %file = call-tool($server, 'fs_delete', { path => 'scratch/delete/gone.txt' });
+	nok result-errored(%file), 'Deleting a file succeeds';
+	is result-text(%file), "Deleted file 'scratch/delete/gone.txt'", 'Confirmation names the file';
+	nok $dir.add('gone.txt').e, 'And it is gone from disk';
+
+	my %empty = call-tool($server, 'fs_delete', { path => 'scratch/delete/hollow' });
+	is result-text(%empty), "Deleted empty directory 'scratch/delete/hollow'",
+		'An empty directory goes without ceremony';
+	nok $dir.add('hollow').e, 'And is gone from disk';
+
+	errors-with $server, 'fs_delete', { path => 'scratch/delete/full' },
+		'set recursive to true', 'A directory with contents is refused, naming the way through';
+	ok $dir.add('full').add('keep.txt').e, 'And nothing inside it was touched';
+
+	my %deep = call-tool($server, 'fs_delete', { path => 'scratch/delete/full', recursive => True });
+	is result-text(%deep), "Deleted directory 'scratch/delete/full' and everything below it",
+		'Recursive delete says how much it took';
+	nok $dir.add('full').e, 'The whole subtree is gone';
+
+	errors-with $server, 'fs_delete', { path => 'scratch/delete/ghost.txt' },
+		"Path not found: 'scratch/delete/ghost.txt'", 'A missing path is an error result';
+	errors-with $server, 'fs_delete', { path => '.', recursive => True },
+		'Refusing to delete the server root itself', 'The root cannot delete itself';
+
+	# A flag spelled as the JSON word is honoured; anything else is refused
+	# rather than guessed at, since guessing wrong here deletes a tree.
+	$dir.add('quoted').add('nested').mkdir;
+	is result-text(call-tool($server, 'fs_delete', { path => 'scratch/delete/quoted', recursive => 'true' })),
+		"Deleted directory 'scratch/delete/quoted' and everything below it",
+		'A boolean sent as the string "true" is accepted';
+	errors-with $server, 'fs_delete', { path => 'scratch/delete', recursive => 3 },
+		"Parameter 'recursive' must be true or false, not Int",
+		'A number is not quietly read as a flag';
+};
+
+done-testing;

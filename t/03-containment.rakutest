@@ -1,0 +1,196 @@
+use Test;
+use lib 'lib';
+use lib 't/lib';
+use FSTest;
+use MCP::Server;
+use MCP::Server::Tool::FileSystem;
+
+plan 8;
+
+my $sandbox = make-sandbox('containment');
+my $outside = make-sandbox('outside');
+END {
+	nuke($sandbox);
+	nuke($outside);
+}
+
+$sandbox.add('dir').mkdir;
+$sandbox.add('dir').add('inner.txt').spurt('inner');
+$sandbox.add('ok.txt').spurt('fine');
+$outside.add('secret.txt').spurt('SECRET');
+$outside.add('vault').mkdir;
+$outside.add('vault').add('key.txt').spurt('KEY');
+
+my $server = MCP::Server.new(:name<confined>);
+$server.plug: MCP::Server::Tool::FileSystem.new(:root($sandbox));
+
+subtest 'Paths that could leave the root are refused' => {
+	my @cases =
+		'../x'                => "may not contain '..'",
+		'a/../../x'           => "may not contain '..'",
+		# Strict on purpose: '..' is refused even when the result would have
+		# stayed inside the root, so there is one rule to reason about.
+		'dir/../ok.txt'       => "may not contain '..'",
+		'..\\..\\x'           => "may not contain '..'",
+		'/etc/passwd'         => 'must be relative to the configured root',
+		'C:\\Windows'         => 'must be relative to the configured root',
+		'\\\\server\\share'   => 'must be relative to the configured root',
+		'/'                   => 'must be relative to the configured root',
+		''                    => 'must not be empty',
+		"ok\0.txt"            => 'must not contain a null byte',
+		'NUL'                 => 'reserved device name',
+		'nul.txt'             => 'reserved device name',
+		'dir/COM1'            => 'reserved device name',
+	;
+	plan @cases.elems;
+	for @cases -> (:key($path), :value($needle)) {
+		errors-with $server, 'fs_read', { path => $path }, $needle,
+			"read '{$path.subst("\0", '\\0', :g)}' is refused";
+	}
+};
+
+subtest 'Legitimate relative paths are accepted' => {
+	plan 5;
+	is result-text(call-tool($server, 'fs_read', { path => 'ok.txt' })), 'fine',
+		'Plain relative path';
+	is result-text(call-tool($server, 'fs_read', { path => './ok.txt' })), 'fine',
+		'Leading ./ is harmless';
+	is result-text(call-tool($server, 'fs_read', { path => 'dir//inner.txt' })), 'inner',
+		'Repeated separators collapse';
+	is result-text(call-tool($server, 'fs_read', { path => 'dir\\inner.txt' })), 'inner',
+		'Backslash is accepted as a separator on every platform';
+	is result-text(call-tool($server, 'fs_stat', { path => '.' })).lines.first(*.starts-with('path')),
+		'path: .', 'The root itself is addressable as .';
+};
+
+subtest 'Every tool routes through the resolver' => {
+	plan 11;
+	errors-with $server, 'fs_read',  { path => '../ok.txt' },
+		"may not contain '..'", 'read';
+	errors-with $server, 'fs_list',  { path => '..' },
+		"may not contain '..'", 'list';
+	errors-with $server, 'fs_glob',  { pattern => '*', path => '..' },
+		"may not contain '..'", 'glob';
+	errors-with $server, 'fs_stat',  { path => '/etc' },
+		'must be relative to the configured root', 'stat';
+	errors-with $server, 'fs_grep',  { pattern => 'x', path => '..' },
+		"may not contain '..'", 'grep';
+	errors-with $server, 'fs_write', { path => '../escape.txt', content => 'x' },
+		"may not contain '..'", 'write';
+	errors-with $server, 'fs_mkdir', { path => '../boom' },
+		"may not contain '..'", 'mkdir';
+	errors-with $server, 'fs_edit',
+		{ path => '../ok.txt', 'old-string' => 'fine', 'new-string' => 'ruined' },
+		"may not contain '..'", 'edit';
+	# move has two path parameters, and either one on its own must be enough
+	# to stop the call.
+	errors-with $server, 'fs_move', { from => '../ok.txt', to => 'landed.txt' },
+		"may not contain '..'", 'move (from)';
+	errors-with $server, 'fs_move', { from => 'ok.txt', to => '../landed.txt' },
+		"may not contain '..'", 'move (to)';
+	errors-with $server, 'fs_delete', { path => '../ok.txt' },
+		"may not contain '..'", 'delete';
+};
+
+subtest 'Refused writes leave nothing behind' => {
+	plan 7;
+	my $file  = $sandbox.parent.add("mcp-fs-escape-{$*PID}.txt");
+	my $dir   = $sandbox.parent.add("mcp-fs-boom-{$*PID}");
+	my $moved = $sandbox.parent.add("mcp-fs-moved-{$*PID}.txt");
+	errors-with $server, 'fs_write', { path => "../{$file.basename}", content => 'x' },
+		"may not contain '..'", 'Escaping write refused';
+	errors-with $server, 'fs_mkdir', { path => "../{$dir.basename}" },
+		"may not contain '..'", 'Escaping mkdir refused';
+	errors-with $server, 'fs_move', { from => 'ok.txt', to => "../{$moved.basename}" },
+		"may not contain '..'", 'Escaping move refused';
+	nok $file.e, 'No file created outside the root';
+	nok $dir.e, 'No directory created outside the root';
+	nok $moved.e, 'Nothing moved outside the root';
+	ok $sandbox.add('ok.txt').e, 'And the file the move named is still where it was';
+};
+
+subtest 'path-contains walks the parent chain' => {
+	plan 6;
+	my &contains = &MCP::Server::Tool::FileSystem::path-contains;
+	ok contains($sandbox, $sandbox), 'The root contains itself';
+	ok contains($sandbox, $sandbox.add('dir').add('inner.txt')), 'A descendant is contained';
+	nok contains($sandbox, $sandbox.parent), 'An ancestor is not contained';
+	nok contains($sandbox, $outside), 'An unrelated directory is not contained';
+
+	# The string-prefix bug this exists to avoid: /tmp/root2 is not in /tmp/root.
+	my $sibling = $sandbox.parent.add($sandbox.basename ~ '2');
+	nok contains($sandbox, $sibling), 'A sibling sharing the root as a string prefix is not contained';
+	ok contains($sibling, $sibling.add('child')), 'That sibling contains its own children';
+};
+
+subtest 'Symlinks pointing out of the root are refused' => {
+	plan 8;
+	my $file-link = $sandbox.add('escape.txt');
+	my $dir-link  = $sandbox.add('escape-dir');
+	# Symlink creation can legitimately fail (an unprivileged Windows host, a
+	# filesystem without link support), and sinking the Failure it returns would
+	# throw — hence the try. The reads below must fail either way, so the
+	# assertions adapt rather than skip.
+	try $outside.add('secret.txt').symlink($file-link);
+	try $outside.add('vault').symlink($dir-link);
+
+	my $file-needle = $file-link.l ?? 'escapes the configured root' !! 'not found';
+	errors-with $server, 'fs_read', { path => 'escape.txt' }, $file-needle,
+		'Reading through a symlinked file is refused';
+
+	my $dir-needle = $dir-link.l ?? 'escapes the configured root' !! 'not found';
+	errors-with $server, 'fs_read', { path => 'escape-dir/key.txt' }, $dir-needle,
+		'Reading through a symlinked directory is refused';
+	errors-with $server, 'fs_list', { path => 'escape-dir' }, $dir-needle,
+		'Listing a symlinked directory is refused';
+	errors-with $server, 'fs_write', { path => 'escape.txt', content => 'x' }, $file-needle,
+		'Writing through a symlinked file is refused';
+	errors-with $server, 'fs_edit',
+		{ path => 'escape.txt', 'old-string' => 'SECRET', 'new-string' => 'x' }, $file-needle,
+		'Editing through a symlinked file is refused';
+	errors-with $server, 'fs_grep', { pattern => 'KEY', path => 'escape-dir' }, $dir-needle,
+		'Searching a symlinked directory is refused';
+
+	# A search of the root must not do by accident what naming the link does
+	# not do on purpose: the walk never descends a symlinked directory, and a
+	# symlinked file whose target is outside the root is never opened.
+	my $swept = result-text(call-tool($server, 'fs_grep', { pattern => 'KEY', path => '.' }));
+	nok $swept.contains('key.txt'), 'A search of the whole root never reaches through the directory link';
+	nok result-text(call-tool($server, 'fs_grep', { pattern => 'SECRET', path => '.' })).contains('escape.txt'),
+		'Nor through the file link';
+};
+
+subtest 'Symlinks staying inside the root still work' => {
+	plan 2;
+	my $link = $sandbox.add('inside.txt');
+	try $sandbox.add('dir').add('inner.txt').symlink($link);
+	my %response = call-tool($server, 'fs_read', { path => 'inside.txt' });
+	if $link.l {
+		nok result-errored(%response), 'An in-root symlink is not treated as an escape';
+		is result-text(%response), 'inner', 'Its target reads back';
+	} else {
+		# No symlink support: the tool must still fail cleanly rather than lie.
+		ok result-errored(%response), 'Without symlink support the read fails cleanly';
+		ok result-text(%response).contains('not found'), 'And says the file is missing';
+	}
+};
+
+subtest 'A recursive delete unlinks symlinks instead of following them' => {
+	plan 4;
+	my $doomed = $sandbox.add('doomed');
+	$doomed.mkdir;
+	$doomed.add('own.txt').spurt('mine');
+	my $link = $doomed.add('link-out');
+	try $outside.add('vault').symlink($link);
+
+	my %response = call-tool($server, 'fs_delete', { path => 'doomed', recursive => True });
+	nok result-errored(%response), 'The recursive delete succeeds';
+	is result-text(%response), "Deleted directory 'doomed' and everything below it",
+		'And says what it took';
+	nok $doomed.e, 'The directory and its own contents are gone';
+	# True either way on a host without symlinks, where nothing was planted:
+	# the point is that the delete never reached outside the root.
+	ok $outside.add('vault').add('key.txt').e, 'What the link pointed at outside the root survives';
+};
+
+done-testing;

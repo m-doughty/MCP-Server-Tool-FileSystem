@@ -1,0 +1,44 @@
+Revision history for MCP::Server::Tool::FileSystem
+
+{{$NEXT}}
+
+0.1.0  2026-08-09T20:00:53+01:00
+    - Initial release
+    - MCP::Server::Tool::FileSystem: a root-confined filesystem toolkit that
+      plugs into any MCP::Server via $server.plug($kit) or
+      MCP::Server.new(:tools['FileSystem' => { root => '...' }]).
+    - Tools (default prefix "fs"): read, write, edit, list, glob, grep, stat,
+      mkdir, move, delete. A read-only kit registers only the five reading
+      tools — read, list, glob, grep and stat — and never advertises the rest.
+    - edit(path, old-string, new-string, replace-all): exact-match replacement
+      with no fuzzy matching. Zero matches, an ambiguous match without
+      replace-all, an empty old-string and an old-string equal to new-string
+      are all refused; the confirmation counts occurrences and bytes.
+    - read gained optional offset (1-based) and limit. Omitting both returns
+      the file byte for byte as before; a range comes back numbered "N<tab>text"
+      with a "[lines A-B of N total]" footer, and reading past the end is an
+      answer rather than an error.
+    - grep(pattern, path, regex, glob, context, max-results): GNU-grep-shaped
+      output ("path:line:text", "-" for context lines, "--" between groups).
+      Literal by default; regex mode is a native Raku regex, and a pattern
+      carrying a code block is refused by Rakudo's interpolation guard rather
+      than executed. Binary and non-UTF-8 files are skipped and counted, and
+      the search stops at max-results with a notice.
+    - move(from, to) and delete(path, recursive). Both ends of a move go
+      through the resolver; an existing destination, a missing destination
+      parent, and moving or deleting the root itself are all refused. A
+      recursive delete unlinks symlinks instead of following them.
+    - Files are read as bytes and decoded once rather than slurped as text:
+      Raku's text-mode slurp folds CRLF into LF and spurt never puts it back,
+      which would have made every edit of a CRLF file rewrite the lines it did
+      not touch. read is now verbatim in the sense edit needs it to be.
+    - Parameter naming is a documented contract: location parameters are
+      exactly "path", "from" and "to", and multi-word parameters are
+      kebab-case, so a permission layer in front of the server can find the
+      paths a call would touch by name.
+    - Containment: every path parameter must be relative, may not contain ".."
+      and may not name a Windows device; the nearest existing ancestor is
+      resolved and checked against the root by parent-chain walk, so symlinks
+      planted inside the sandbox cannot be used as a door out of it.
+    - glob is a portable, regex-free matcher: "*" matches within one path
+      segment, "?" matches one character, nothing else is special.

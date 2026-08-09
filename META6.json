@@ -1,0 +1,30 @@
+{
+  "auth": "zef:apogee",
+  "authors": [
+    "Matt Doughty"
+  ],
+  "build-depends": [
+  ],
+  "depends": [
+    "MCP::Server:auth<zef:apogee>"
+  ],
+  "description": "Root-confined filesystem tools for MCP::Server",
+  "license": "Artistic-2.0",
+  "name": "MCP::Server::Tool::FileSystem",
+  "perl": "6.d",
+  "provides": {
+    "MCP::Server::Tool::FileSystem": "lib/MCP/Server/Tool/FileSystem.rakumod"
+  },
+  "resources": [
+  ],
+  "source-url": "https://github.com/m-doughty/MCP-Server-Tool-FileSystem.git",
+  "tags": [
+    "mcp",
+    "tools",
+    "filesystem",
+    "llm"
+  ],
+  "test-depends": [
+  ],
+  "version": "0.1.0"
+}

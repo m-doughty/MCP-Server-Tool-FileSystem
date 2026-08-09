@@ -1,0 +1,69 @@
+use Test;
+use lib 'lib';
+use lib 't/lib';
+use FSTest;
+# NB: this file must never `use MCP::Server::Tool::FileSystem` — the whole point
+# is the path a real deployment takes, where the pack is named in configuration
+# and loaded at runtime by MCP::Server's require-based loader.
+use MCP::Server;
+use MCP::Server::Toolkit;
+
+plan 4;
+
+my $sandbox = make-sandbox('selfload');
+END nuke($sandbox);
+
+$sandbox.add('hello.txt').spurt('hello from the sandbox');
+
+subtest 'Bare name in :tools resolves under MCP::Server::Tool::' => {
+	plan 3;
+	my $server = MCP::Server.new(
+		:name<t>,
+		:tools['FileSystem' => { root => $sandbox.Str, prefix => 'sb' }],
+	);
+	is-deeply tool-names($server),
+		<sb_delete sb_edit sb_glob sb_grep sb_list sb_mkdir sb_move sb_read sb_stat sb_write>.list,
+		'Toolkit loaded by name and namespaced by the reserved prefix key';
+
+	my %response = call-tool($server, 'sb_read', { path => 'hello.txt' });
+	nok result-errored(%response), 'Dynamically loaded read tool works';
+	is result-text(%response), 'hello from the sandbox', 'And returns the file contents';
+};
+
+subtest 'Config keys travel through :tools' => {
+	plan 2;
+	my $server = MCP::Server.new(
+		:name<t>,
+		:tools['FileSystem' => { root => $sandbox.Str, 'read-only' => True }],
+	);
+	is-deeply tool-names($server), <fs_glob fs_grep fs_list fs_read fs_stat>.list,
+		'read-only reaches the pack and drops the mutating tools';
+	is result-text(call-tool($server, 'fs_read', { path => 'hello.txt' })),
+		'hello from the sandbox', 'Default prefix applies when none is configured';
+};
+
+subtest 'The pack satisfies the toolkit contract when required bare' => {
+	plan 3;
+	# Bound rather than looked up via ::('...') afterwards: with MCP::Server
+	# already `use`d, a later ::('...') lookup can miss the freshly loaded slot.
+	my \type = (require ::('MCP::Server::Tool::FileSystem'));
+	ok type ~~ MCP::Server::Toolkit, 'Required type does the Toolkit role';
+	ok type.^can('register'), 'And can register itself';
+	is type.new(root => $sandbox).default-prefix, 'fs', 'Its default prefix is fs';
+};
+
+subtest 'Configuration mistakes fail loudly through :tools' => {
+	plan 3;
+	dies-with { MCP::Server.new(:name<t>, :tools['FileSystem' => { }]) },
+		'Missing required config key(s)', 'Omitting root dies';
+
+	dies-with { MCP::Server.new(:name<t>, :tools['FileSystem' => { root => $sandbox.Str, ro => True }]) },
+		'Unknown config key(s)', 'Typo in a config key dies';
+
+	dies-with {
+		MCP::Server.new(:name<t>, :tools['FileSystem' => { root => $sandbox.add('nope').Str }]);
+	},
+		'FileSystem root does not exist', 'Nonexistent root dies at load time';
+};
+
+done-testing;

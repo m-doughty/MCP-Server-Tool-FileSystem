@@ -1,0 +1,38 @@
+name: test
+
+# NB: the dependency install step pulls MCP::Server from the ecosystem. Until
+# MCP::Server 0.3.0 (the release that ships the toolkit system this pack builds
+# on) is published, that step fails and CI stays red — nothing here needs
+# changing when it lands.
+
+on:
+  push:
+    branches:
+      - '*'
+    tags-ignore:
+      - '*'
+  pull_request:
+
+jobs:
+  raku:
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-latest
+          - macos-latest
+          - windows-latest
+        raku-version:
+          - 'latest'
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v6
+      - uses: Raku/setup-raku@v1
+        with:
+          raku-version: ${{ matrix.raku-version }}
+      - name: Install Dependencies
+        run: zef install --/test --test-depends --deps-only .
+      - name: Install App::Prove6
+        run: zef install --/test App::Prove6
+      - name: Run Tests
+        run: prove6 -I. t

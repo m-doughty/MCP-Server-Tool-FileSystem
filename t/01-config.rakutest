@@ -1,0 +1,89 @@
+use Test;
+use lib 'lib';
+use lib 't/lib';
+use FSTest;
+use MCP::Server;
+use MCP::Server::Tool::FileSystem;
+
+plan 6;
+
+my $sandbox = make-sandbox('config');
+END nuke($sandbox);
+
+subtest 'from-config happy path' => {
+	plan 4;
+	my $kit = MCP::Server::Tool::FileSystem.from-config({ root => $sandbox.Str });
+	ok $kit.root ~~ IO::Path, 'Str root coerced to IO::Path';
+	is $kit.root.absolute, $sandbox.resolve.absolute, 'Root normalised to the resolved sandbox';
+	nok $kit.read-only, 'read-only defaults to False';
+	is $kit.default-prefix, 'fs', 'default-prefix is fs';
+};
+
+subtest 'Config key validation' => {
+	plan 4;
+	dies-with { MCP::Server::Tool::FileSystem.from-config({ root => $sandbox.Str, rooot => 'x' }) },
+		'Valid keys: read-only, root', 'Unknown key dies listing the valid keys';
+
+	dies-with { MCP::Server::Tool::FileSystem.from-config({ }) },
+		'Missing required config key(s)', 'Missing root dies';
+
+	dies-with { MCP::Server::Tool::FileSystem.from-config({ root => $sandbox.Str, prefix => 'fs' }) },
+		"Config key 'prefix' is reserved", 'Reserved prefix key dies';
+
+	ok MCP::Server::Tool::FileSystem.from-config({ root => $sandbox.Str, 'read-only' => True }).read-only,
+		'Hyphenated read-only key reaches the attribute';
+};
+
+subtest 'Root must be an existing directory' => {
+	plan 3;
+	dies-with { MCP::Server::Tool::FileSystem.from-config({ root => $sandbox.add('no-such-dir').Str }) },
+		'FileSystem root does not exist or is not a directory', 'Nonexistent root dies';
+
+	my $file = $sandbox.add('not-a-dir.txt');
+	$file.spurt('x');
+	dies-with { MCP::Server::Tool::FileSystem.new(root => $file) },
+		'FileSystem root does not exist or is not a directory', 'A file as root dies';
+
+	dies-with { MCP::Server::Tool::FileSystem.new },
+		'root', 'Omitting root entirely dies';
+};
+
+subtest 'Read-write kits register every tool' => {
+	plan 1;
+	my $server = MCP::Server.new(:name<rw>);
+	$server.plug: MCP::Server::Tool::FileSystem.new(:root($sandbox));
+	is-deeply tool-names($server),
+		<fs_delete fs_edit fs_glob fs_grep fs_list fs_mkdir fs_move fs_read fs_stat fs_write>.list,
+		'All ten tools advertised under the default prefix';
+};
+
+subtest 'read-only kits never advertise the mutating tools' => {
+	my @mutating = <fs_delete fs_edit fs_mkdir fs_move fs_write>;
+	plan 1 + 2 * @mutating.elems;
+	my $server = MCP::Server.new(:name<ro>);
+	$server.plug: MCP::Server::Tool::FileSystem.new(:root($sandbox), :read-only);
+	is-deeply tool-names($server), <fs_glob fs_grep fs_list fs_read fs_stat>.list,
+		'Only the five reading tools appear in tools/list';
+
+	# Not merely undocumented: calling one is an unknown-tool error, so a model
+	# that guessed the name from another deployment gets told plainly.
+	for @mutating -> $name {
+		my %response = call-tool($server, $name, { path => 'x.txt' });
+		is %response<error><code>, -32602, "Calling the unregistered $name is an invalid-params error";
+		ok %response<error><message>.contains('Unknown tool'), "Error names $name as unknown";
+	}
+};
+
+subtest 'read-only survives the config round trip' => {
+	plan 2;
+	my $kit = MCP::Server::Tool::FileSystem.from-config({
+		root => $sandbox.Str, 'read-only' => True,
+	});
+	my $server = MCP::Server.new(:name<ro-config>);
+	$server.plug: $kit;
+	is-deeply tool-names($server), <fs_glob fs_grep fs_list fs_read fs_stat>.list,
+		'Configured read-only kit registers five tools';
+	is $kit.root.absolute, $sandbox.resolve.absolute, 'Root still normalised';
+};
+
+done-testing;
