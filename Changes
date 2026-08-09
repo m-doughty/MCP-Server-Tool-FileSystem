@@ -2,6 +2,18 @@ Revision history for MCP::Server::Tool::FileSystem
 
 {{$NEXT}}
 
+0.1.1  2026-08-09T20:26:49+01:00
+    - SECURITY: symlink containment now holds on Windows. The defence relied
+      on IO::Path.resolve, which does not follow symlinks there, so a link
+      planted in the sandbox could be read and written straight through
+      (caught by the Windows CI lane). Containment now chases links itself
+      (physical-path, realpath-style over readlink, hop budget against
+      cycles, fail-closed on unreadable or drive-relative targets) — one
+      code path on every platform. path-contains unifies separator spelling
+      on Windows; the root itself is chased at construction. New containment
+      tests: chains, mid-path directory links, relative targets (in-root
+      '..' targets still read through), cycles.
+
 0.1.0  2026-08-09T20:00:53+01:00
     - Initial release
     - MCP::Server::Tool::FileSystem: a root-confined filesystem toolkit that

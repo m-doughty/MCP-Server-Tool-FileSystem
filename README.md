@@ -335,11 +335,11 @@ Confinement is the whole point of this pack, so it is done in layers that each h
 
   * **No null bytes.**
 
-  * **Symlink-resolved ancestor check.** The candidate path is built segment by segment under the root; then the nearest ancestor that actually exists is `.resolve`d and checked against the root. A symlink planted inside the sandbox therefore cannot be used as a door out of it, whether it points at a file or a directory.
+  * **Physical-path symlink chase.** The candidate path is built segment by segment under the root; then every symlink in it is chased to its destination — component by component, the way `realpath` works, with a hop budget against cycles — and the *physical* result is checked against the root. A symlink planted inside the sandbox therefore cannot be used as a door out of it, whether it points at a file or a directory, whether directly or through a chain, and whether its target is absolute or relative. The chase is the pack's own (over `readlink`), **not** `IO::Path.resolve`, because `.resolve` does not follow symlinks on Windows — an unfollowed link is an open door the OS walks through at open time even though a check did not. One code path runs on every platform. A link whose target cannot be read, a chain that exceeds the hop budget, and a Windows drive-relative target (`C:foo`) are all refused outright: fail closed.
 
-  * **Parent-chain containment, not string prefixes.** The final check walks `.parent` from the resolved path up to the filesystem root looking for the root itself. `/srv/root2` is not inside `/srv/root`, and no separator-spelling difference can fake a match.
+  * **Parent-chain containment, not string prefixes.** The final check walks `.parent` from the chased path up to the filesystem root looking for the root itself. `/srv/root2` is not inside `/srv/root`, and no separator-spelling difference can fake a match — on Windows both slash spellings are unified before comparing.
 
-The textual rejections are deliberately redundant with the resolved check: they hold even on platforms where `IO::Path.resolve` is historically weak (Windows), and they make the failure message say what the model did wrong.
+The textual rejections are deliberately redundant with the physical check: two independent layers fail independently, and they make the failure message say what the model did wrong.
 
 Comparison is exact-case. On a case-insensitive filesystem, a root configured with different casing than the path the OS reports can only produce a *false negative* — access denied — never a false positive. It fails closed.
 

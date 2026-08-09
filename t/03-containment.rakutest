@@ -5,7 +5,7 @@ use FSTest;
 use MCP::Server;
 use MCP::Server::Tool::FileSystem;
 
-plan 8;
+plan 9;
 
 my $sandbox = make-sandbox('containment');
 my $outside = make-sandbox('outside');
@@ -173,6 +173,66 @@ subtest 'Symlinks staying inside the root still work' => {
 		ok result-errored(%response), 'Without symlink support the read fails cleanly';
 		ok result-text(%response).contains('not found'), 'And says the file is missing';
 	}
+};
+
+subtest 'Symlink chains, relative targets and cycles' => {
+	plan 6;
+
+	# Same adapt-don't-skip convention as above: when links cannot be made,
+	# every read fails as plain not-found and the assertions follow suit.
+	#
+	# Absolute-target links go through IO::Path.symlink.  The RELATIVE ones
+	# go through `ln -s`, because Rakudo's .symlink absolutifies a relative
+	# invocant against the CWD before writing the link — there is no way to
+	# create a genuinely relative symlink from the core API.  On a host
+	# whose `ln` copies instead of linking (Git for Windows without MSYS
+	# winsymlinks), the copy still reads back 'fine', which the assertions
+	# below accept: the point here is the chase, not `ln`.
+	try $outside.add('secret.txt').symlink($sandbox.add('hop-out.txt'));
+	try $sandbox.add('hop-out.txt').symlink($sandbox.add('hop-in.txt'));
+	try $outside.symlink($sandbox.add('sneak'));                   # dir link out, used mid-path
+	try $sandbox.add('loop-b').symlink($sandbox.add('loop-a'));
+	try $sandbox.add('loop-a').symlink($sandbox.add('loop-b'));
+	my $ = try run 'ln', '-s', 'ok.txt', 'alias.txt',
+		:cwd($sandbox), :out(False), :err(False);
+	my $ = try run 'ln', '-s', '../ok.txt', 'updown.txt',
+		:cwd($sandbox.add('dir')), :out(False), :err(False);
+
+	my $chain = $sandbox.add('hop-in.txt');
+	errors-with $server, 'fs_read', { path => 'hop-in.txt' },
+		($chain.l ?? 'escapes the configured root' !! 'not found'),
+		'A chain of links ending outside the root is refused';
+
+	errors-with $server, 'fs_read', { path => 'sneak/secret.txt' },
+		($sandbox.add('sneak').l ?? 'escapes the configured root' !! 'not found'),
+		'A directory link out of the root is refused mid-path';
+
+	errors-with $server, 'fs_read', { path => 'loop-a' },
+		($sandbox.add('loop-a').l ?? 'probable cycle' !! 'not found'),
+		'A symlink cycle is refused rather than looped';
+
+	my $alias = $sandbox.add('alias.txt');
+	my %alias = call-tool($server, 'fs_read', { path => 'alias.txt' });
+	ok ($alias.e ?? (!result-errored(%alias) && result-text(%alias) eq 'fine')
+	             !! result-errored(%alias)),
+		'A relative in-root link reads through';
+
+	my $updown = $sandbox.add('dir').add('updown.txt');
+	my %updown = call-tool($server, 'fs_read', { path => 'dir/updown.txt' });
+	ok ($updown.e ?? (!result-errored(%updown) && result-text(%updown) eq 'fine')
+	              !! result-errored(%updown)),
+		"A relative link using '..' that stays inside the root reads through";
+
+	# The chase itself, without the tool layer: the physical destination of
+	# the in-root alias is inside the root, the escaping chain's is not.
+	# Only meaningful when the links are real; vacuously true otherwise,
+	# matching the subtest's adapt convention.
+	my &physical = &MCP::Server::Tool::FileSystem::physical-path;
+	my &contains = &MCP::Server::Tool::FileSystem::path-contains;
+	ok (($alias.l && $chain.l)
+		?? (contains($sandbox, physical($alias)) && !contains($sandbox, physical($chain)))
+		!! True),
+		'physical-path chases to the true destination';
 };
 
 subtest 'A recursive delete unlinks symlinks instead of following them' => {

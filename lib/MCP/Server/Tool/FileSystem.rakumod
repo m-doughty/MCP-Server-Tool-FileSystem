@@ -1,5 +1,11 @@
 use MCP::Server::Toolkit;
 
+# For nqp::readlink in physical-path below.  Rakudo has no public readlink,
+# and IO::Path.resolve — the obvious alternative — is documented not to
+# follow symlinks on Windows, which is exactly the case the containment
+# check exists for.
+use nqp;
+
 #| Root-confined filesystem tools for MCP::Server.  Every path a client sends
 #| is interpreted relative to $.root and can never reach outside it, so an LLM
 #| gets a usable filesystem without getting the whole machine.
@@ -12,8 +18,11 @@ submethod TWEAK {
 	die "FileSystem root does not exist or is not a directory: {$!root}"
 		unless $!root.d;
 	# Resolve once, up front: every containment check compares against this, so
-	# it must already be free of symlinks and relative segments.
+	# it must already be free of symlinks and relative segments.  resolve alone
+	# is not enough — it does not follow symlinks on Windows — so the same
+	# link chase the resolver uses runs on the root too.
 	$!root .= resolve;
+	$!root = physical-path($!root);
 }
 
 method default-prefix(--> Str) { 'fs' }
@@ -407,7 +416,14 @@ method !grep-files(
 		# refuses to descend symlinked directories; this is the same rule for
 		# the files themselves, so a planted link cannot be read out through
 		# a search the way it cannot be read out through the read tool.
-		return True if $file.l && !path-contains($!root, $file.resolve);
+		# physical-path rather than .resolve, which does not follow links on
+		# Windows; a link that cannot be chased is skipped like an unreadable
+		# file — fail closed, keep searching.
+		if $file.l {
+			my $physical = try physical-path($file);
+			return True without $physical;
+			return True unless path-contains($!root, $physical);
+		}
 
 		my $bytes = try $file.slurp(:bin);
 		return True without $bytes;   # unreadable: skipped like an unreadable directory
@@ -554,8 +570,8 @@ my constant RESERVED-SEGMENTS = set flat
 
 #| Turn a client-supplied relative path into an IO::Path under $.root, or die.
 #| Three layers, deliberately redundant: textual rejection of anything that
-#| could be absolute, a ban on ".." segments, and a resolved-ancestor check
-#| that catches symlinks pointing out of the sandbox.
+#| could be absolute, a ban on ".." segments, and a physical-path check that
+#| chases every symlink itself and catches links pointing out of the sandbox.
 method !resolve(Str:D $rel --> IO::Path:D) {
 	die 'Path must not be empty' if $rel eq '';
 	die "Path must not contain a null byte: '$rel'" if $rel.contains("\0");
@@ -575,32 +591,141 @@ method !resolve(Str:D $rel --> IO::Path:D) {
 	my $candidate = $!root;
 	$candidate .= add($_) for @parts;
 
-	# Symlink defence: resolve the nearest ancestor that actually exists and
-	# check *that* against the root, so a link planted inside the sandbox
-	# cannot be used as a door out of it.
-	my $anchor = $candidate;
-	$anchor .= parent until $anchor.e || $anchor.parent.absolute eq $anchor.absolute;
+	# Symlink defence: chase every link in the path ourselves and check the
+	# PHYSICAL destination against the root, so a link planted inside the
+	# sandbox cannot be used as a door out of it.  IO::Path.resolve would be
+	# the obvious tool, but it does not follow symlinks on Windows — and an
+	# unfollowed link is an open door, because the OS follows it at open time
+	# even though the check did not.  physical-path is the same code on every
+	# platform.  Components that do not exist yet cannot be links, so a path
+	# about to be written is chased exactly as far as it really goes.
 	die "Path escapes the configured root: '$rel'"
-		unless path-contains($!root, $anchor.resolve);
+		unless path-contains($!root, physical-path($candidate));
 
 	$candidate;
 }
 
+#|( The physical path: every symlink chased to its destination, component by
+    component, the way realpath does it.  Exists because IO::Path.resolve is
+    documented not to follow symlinks on Windows, and a containment check is
+    only as good as the resolution it checks.  Fails closed: dies when a link
+    target cannot be read, when a chain exceeds :max-hops (a cycle, in
+    practice), or when a Windows link uses a drive-relative target.  Exposed
+    with `our` scope for the containment tests — not part of the public API. )
+our sub physical-path(IO::Path:D $path, Int:D :$max-hops = 40 --> IO::Path:D) {
+	my ($volume, @todo) = split-absolute($path.absolute);
+	my Str @out;
+	my Int $hops = 0;
+
+	while @todo {
+		my Str $part = @todo.shift.Str;
+		next if $part eq '' || $part eq '.';
+		if $part eq '..' {
+			# The chased prefix is link-free, so popping a component is what
+			# the filesystem itself would do — this is what makes a link to
+			# 'a/../b' land where the OS would land it.
+			@out.pop if @out;
+			next;
+		}
+
+		my IO::Path $cur = join-parts($volume, (|@out, $part));
+		unless $cur.l {
+			@out.push: $part;
+			next;
+		}
+
+		die "Symlink chain is too long at '$cur' — refusing a probable cycle"
+			if ++$hops > $max-hops;
+
+		my $target = try nqp::readlink($cur.absolute);
+		die "Cannot read the symlink at '$cur' — refusing rather than guessing where it points"
+			without $target;
+
+		if $*DISTRO.is-win {
+			# Windows link targets can restart the walk at a new volume (UNC
+			# or drive-rooted), at the current volume's root (separator-
+			# rooted), or continue relative to the link's directory.  A
+			# drive-relative target ('C:foo') depends on a per-drive working
+			# directory this process does not track: refuse it.
+			if $target ~~ /^ [ '\\\\' | '//' ] /
+			|| $target ~~ /^ <[A..Za..z]> ':' <[\/\\]> / {
+				my ($v, @tc) = split-absolute($target);
+				$volume = $v;
+				@out = ();
+				@todo.prepend: @tc;
+				next;
+			}
+			die "Symlink at '$cur' has a drive-relative target '$target' — refusing"
+				if $target ~~ /^ <[A..Za..z]> ':' /;
+			@out = () if $target ~~ /^ <[\/\\]> /;
+			@todo.prepend: $target.split(/<[\/\\]>+/).grep(*.chars);
+			next;
+		}
+
+		# POSIX: only '/' separates and only a leading '/' restarts the walk.
+		# A backslash is an ordinary filename character here.
+		@out = () if $target.starts-with('/');
+		@todo.prepend: $target.split('/').grep(*.chars);
+	}
+
+	join-parts($volume, @out);
+}
+
+# A path split into (volume, components...): '' and ('a','b') for '/a/b';
+# 'C:' and ('a','b') for 'C:\a\b'; '//srv/share' and ('x') for a UNC path.
+# Only Windows treats '\' as a separator or recognises volumes — on POSIX
+# both are legal filename characters.  The drive letter is upcased so the
+# same volume always spells the same way in comparisons.
+my sub split-absolute(Str:D $abs) {
+	if $*DISTRO.is-win {
+		if $abs ~~ /^ [ '\\\\' | '//' ] / {
+			my @comps = $abs.split(/<[\/\\]>+/).grep(*.chars);
+			die "Cannot resolve a UNC path with no share name: '$abs'"
+				unless @comps.elems >= 2;
+			my Str $volume = '//' ~ @comps.shift ~ '/' ~ @comps.shift;
+			return ($volume, |@comps);
+		}
+		my @comps = $abs.split(/<[\/\\]>+/);
+		my Str $volume = '';
+		if @comps && @comps.head ~~ /^ <[A..Za..z]> ':' $/ {
+			$volume = @comps.shift.uc;
+		}
+		return ($volume, |@comps.grep(*.chars));
+	}
+	('', |$abs.split('/').grep(*.chars));
+}
+
+# The inverse: a volume plus components back into an IO::Path, always
+# '/'-joined.  Windows accepts '/' everywhere, and emitting one spelling is
+# what lets path-contains compare paths textually.
+my sub join-parts(Str:D $volume, @parts --> IO::Path:D) {
+	($volume ~ '/' ~ @parts.join('/')).IO;
+}
+
 #| Internal: True when $path is $root itself or lives underneath it.  Walks the
 #| parent chain rather than comparing string prefixes, so /srv/root2 is never
-#| mistaken for a child of /srv/root and separator spelling cannot matter.
-#| Comparison is exact-case: on a case-insensitive filesystem a case-mismatched
-#| root can only deny access, never grant it.  Exposed with `our` scope for the
-#| containment tests — not part of the public API.
+#| mistaken for a child of /srv/root; separator spelling is unified on Windows
+#| before comparing, where either slash may appear.  Comparison is exact-case:
+#| on a case-insensitive filesystem a case-mismatched root can only deny
+#| access, never grant it.  Exposed with `our` scope for the containment
+#| tests — not part of the public API.
 our sub path-contains(IO::Path:D $root, IO::Path:D $path --> Bool:D) {
+	my Str $root-key = path-key($root);
 	my $p = $path;
 	loop {
-		return True if $p.absolute eq $root.absolute;
+		return True if path-key($p) eq $root-key;
 		my $up = $p.parent;
 		last if $up.absolute eq $p.absolute;   # reached the filesystem root
 		$p = $up;
 	}
 	False;
+}
+
+# The comparison spelling of a path: separators unified on Windows, the
+# string untouched on POSIX, where a backslash is an ordinary filename
+# character.
+my sub path-key(IO::Path:D $p --> Str:D) {
+	$*DISTRO.is-win ?? $p.absolute.subst('\\', '/', :g) !! $p.absolute;
 }
 
 #| Path segments of $path relative to $root.  Callers join with '/' so tool
