@@ -53,8 +53,8 @@ subtest 'Read-write kits register every tool' => {
 	my $server = MCP::Server.new(:name<rw>);
 	$server.plug: MCP::Server::Tool::FileSystem.new(:root($sandbox));
 	is-deeply tool-names($server),
-		<fs_delete fs_edit fs_glob fs_grep fs_list fs_mkdir fs_move fs_read fs_stat fs_write>.list,
-		'All ten tools advertised under the default prefix';
+		<fs_delete fs_edit fs_glob fs_grep fs_list fs_map fs_mkdir fs_move fs_read fs_stat fs_write>.list,
+		'All eleven tools advertised under the default prefix';
 };
 
 subtest 'read-only kits never advertise the mutating tools' => {
@@ -62,8 +62,8 @@ subtest 'read-only kits never advertise the mutating tools' => {
 	plan 1 + 2 * @mutating.elems;
 	my $server = MCP::Server.new(:name<ro>);
 	$server.plug: MCP::Server::Tool::FileSystem.new(:root($sandbox), :read-only);
-	is-deeply tool-names($server), <fs_glob fs_grep fs_list fs_read fs_stat>.list,
-		'Only the five reading tools appear in tools/list';
+	is-deeply tool-names($server), <fs_glob fs_grep fs_list fs_map fs_read fs_stat>.list,
+		'Only the six reading tools appear in tools/list';
 
 	# Not merely undocumented: calling one is an unknown-tool error, so a model
 	# that guessed the name from another deployment gets told plainly.
@@ -81,8 +81,8 @@ subtest 'read-only survives the config round trip' => {
 	});
 	my $server = MCP::Server.new(:name<ro-config>);
 	$server.plug: $kit;
-	is-deeply tool-names($server), <fs_glob fs_grep fs_list fs_read fs_stat>.list,
-		'Configured read-only kit registers five tools';
+	is-deeply tool-names($server), <fs_glob fs_grep fs_list fs_map fs_read fs_stat>.list,
+		'Configured read-only kit registers six tools';
 	is $kit.root.absolute, $sandbox.resolve.absolute, 'Root still normalised';
 };
 

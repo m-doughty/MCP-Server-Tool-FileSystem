@@ -1,10 +1,15 @@
 use MCP::Server::Toolkit;
+use Digest::SHA256::Native;
 
 # For nqp::readlink in physical-path below.  Rakudo has no public readlink,
 # and IO::Path.resolve — the obvious alternative — is documented not to
 # follow symlinks on Windows, which is exactly the case the containment
 # check exists for.
 use nqp;
+
+# The map tool's parsing, ranking and rendering.  Everything in there takes
+# bytes and gives back facts; everything in here decides which bytes.
+use MCP::Server::Tool::FileSystem::Map;
 
 #| Root-confined filesystem tools for MCP::Server.  Every path a client sends
 #| is interpreted relative to $.root and can never reach outside it, so an LLM
@@ -13,6 +18,19 @@ unit class MCP::Server::Tool::FileSystem does MCP::Server::Toolkit;
 
 has IO::Path() $.root is required;
 has Bool:D $.read-only = False;
+has Lock $!mutation-lock .= new;
+
+# Per-file parse results for the map tool, keyed by absolute path and valid
+# only while the file's mtime and size are unchanged.  Private, so the
+# toolkit's from-config key list — which is built from public attributes — is
+# unaffected by its existence.  One coarse lock around the whole map body:
+# building a map is measured in file reads, not in microseconds, and two
+# concurrent maps of the same tree have nothing to gain from interleaving.
+has %!map-cache;
+has Lock $!map-lock .= new;
+
+my constant REVISION-SCHEME = 'sha256-v1';
+my constant EXPECTED-REVISIONS = '_expected-revisions';
 
 submethod TWEAK {
 	die "FileSystem root does not exist or is not a directory: {$!root}"
@@ -59,11 +77,14 @@ method register($registrar) {
 			},
 		},
 		handler => -> :%args {
-			self!read-file(
-				arg-str(%args, 'path'),
+			my $rel = arg-str(%args, 'path');
+			self!observed-result('path' => $rel, -> {
+				self!read-file(
+					$rel,
 				arg-int(%args, 'offset', :optional, :min(1)),
 				arg-int(%args, 'limit',  :optional, :min(1)),
-			);
+				);
+			});
 		};
 
 	$registrar.tool: 'list',
@@ -76,7 +97,10 @@ method register($registrar) {
 				description => 'Directory path relative to the root; defaults to the root itself',
 			},
 		},
-		handler => -> :%args { self!list-dir(arg-str(%args, 'path', :default<.>)) };
+		handler => -> :%args {
+			my $rel = arg-str(%args, 'path', :default<.>);
+			self!observed-result('path' => $rel, -> { self!list-dir($rel) });
+		};
 
 	$registrar.tool: 'glob',
 		description => 'Find files anywhere below a directory by wildcard. '
@@ -110,7 +134,10 @@ method register($registrar) {
 				required    => True,
 			},
 		},
-		handler => -> :%args { self!stat-path(arg-str(%args, 'path')) };
+		handler => -> :%args {
+			my $rel = arg-str(%args, 'path');
+			self!observed-result('path' => $rel, -> { self!stat-path($rel) });
+		};
 
 	$registrar.tool: 'grep',
 		description => 'Search the files below a directory inside the server root '
@@ -159,6 +186,43 @@ method register($registrar) {
 			);
 		};
 
+	$registrar.tool: 'map',
+		description => 'Map the shape of the code below a directory before '
+			~ 'reading files: the highest-ranked files as skeletons — path plus '
+			~ 'the definition lines of their most-referenced symbols, never '
+			~ 'bodies — ranked by how much the rest of the tree references them. '
+			~ 'Start here to orient, then read only what matters. Pass query to '
+			~ 'pull the map toward identifiers or topics, and focus to weight '
+			~ 'named files heavily. Understands C, C++, Go, Java, JavaScript, '
+			~ 'Python, Rust, TypeScript and Raku; other files are skipped and '
+			~ 'counted.',
+		params => {
+			path => {
+				type        => 'string',
+				description => 'Directory to map, relative to the root; defaults to the root itself',
+			},
+			query => {
+				type        => 'string',
+				description => 'Space-separated identifiers or words to focus the map on; matching files and symbols rank higher',
+			},
+			focus => {
+				type        => 'string',
+				description => 'Space- or comma-separated file paths, relative to the root, to weight heavily',
+			},
+			'max-chars' => {
+				type        => 'integer',
+				description => 'Upper bound on the size of the map in characters, 512 to 65536; defaults to 8192',
+			},
+		},
+		handler => -> :%args {
+			self!map-repo(
+				arg-str(%args, 'path', :default<.>),
+				arg-str(%args, 'query', :default('')),
+				arg-str(%args, 'focus', :default('')),
+				arg-int(%args, 'max-chars', :default(8192), :min(512), :max(65536)),
+			);
+		};
+
 	# A read-only pack does not merely refuse writes at call time: the mutating
 	# tools are never advertised, so the model is not tempted to try.
 	return if $!read-only;
@@ -180,7 +244,11 @@ method register($registrar) {
 			},
 		},
 		handler => -> :%args {
-			self!write-file(arg-str(%args, 'path'), arg-str(%args, 'content'));
+			my $rel = arg-str(%args, 'path');
+			self!mutation-result(
+				%args, ['path' => $rel],
+				-> { self!write-file($rel, arg-str(%args, 'content')) },
+			);
 		};
 
 	$registrar.tool: 'mkdir',
@@ -193,7 +261,10 @@ method register($registrar) {
 				required    => True,
 			},
 		},
-		handler => -> :%args { self!make-dir(arg-str(%args, 'path')) };
+		handler => -> :%args {
+			my $rel = arg-str(%args, 'path');
+			self!mutation-result(%args, ['path' => $rel], -> { self!make-dir($rel) });
+		};
 
 	$registrar.tool: 'edit',
 		description => 'Replace an exact run of text in a file inside the server '
@@ -223,12 +294,15 @@ method register($registrar) {
 			},
 		},
 		handler => -> :%args {
-			self!edit-file(
-				arg-str(%args, 'path'),
+			my $rel = arg-str(%args, 'path');
+			self!mutation-result(%args, ['path' => $rel], -> {
+				self!edit-file(
+					$rel,
 				arg-str(%args, 'old-string'),
 				arg-str(%args, 'new-string'),
 				arg-bool(%args, 'replace-all'),
-			);
+				);
+			});
 		};
 
 	$registrar.tool: 'move',
@@ -249,7 +323,12 @@ method register($registrar) {
 			},
 		},
 		handler => -> :%args {
-			self!move-path(arg-str(%args, 'from'), arg-str(%args, 'to'));
+			my $from = arg-str(%args, 'from');
+			my $to = arg-str(%args, 'to');
+			self!mutation-result(
+				%args, ['from' => $from, 'to' => $to],
+				-> { self!move-path($from, $to) },
+			);
 		};
 
 	$registrar.tool: 'delete',
@@ -268,8 +347,158 @@ method register($registrar) {
 			},
 		},
 		handler => -> :%args {
-			self!delete-path(arg-str(%args, 'path'), arg-bool(%args, 'recursive'));
+			my $rel = arg-str(%args, 'path');
+			self!mutation-result(
+				%args, ['path' => $rel],
+				-> { self!delete-path($rel, arg-bool(%args, 'recursive')) },
+			);
 		};
+}
+
+# === Optimistic concurrency results ===
+
+# Read observations and mutations return the same text block they always did,
+# plus a machine-only revision map.  The provider bridge keeps that map out of
+# model-visible content while making it available to MCP::Client::Leases.
+method !observed-result(Pair:D $location, &action --> Hash:D) {
+	$!mutation-lock.protect: {
+		my $text = action();
+		self!tool-result($text, [$location]);
+	}
+}
+
+# `_expected-revisions` is intentionally absent from every advertised schema.
+# A lease composer adds it after the model has produced the call.  When it is
+# present it is all-or-nothing: every named mutation location must have a token,
+# and compare + mutation happen under this toolkit instance's one mutation lock.
+method !mutation-result(%args, @locations, &action --> Hash:D) {
+	my $raw = %args{EXPECTED-REVISIONS};
+	my $conditional = %args{EXPECTED-REVISIONS}:exists;
+
+	if $conditional {
+		die "Parameter '{EXPECTED-REVISIONS}' must be an object of location names to revision tokens"
+			unless $raw ~~ Associative;
+		my %expected = $raw.Hash;
+		my @wanted = @locations.map(*.key).List;
+		my @missing = @wanted.grep({
+			!(%expected{$_}:exists) || %expected{$_} !~~ Str:D
+		});
+		my @extra = %expected.keys.grep(-> $key {
+			!@wanted.first(-> $wanted { $wanted eq $key }).defined
+		}).sort;
+		die "Parameter '{EXPECTED-REVISIONS}' must contain a string token for "
+			~ @missing.map({ "'$_'" }).join(', ')
+			if @missing;
+		die "Parameter '{EXPECTED-REVISIONS}' contains unknown location "
+			~ @extra.map({ "'$_'" }).join(', ')
+			if @extra;
+	}
+
+	$!mutation-lock.protect: {
+		if $conditional {
+			my %expected = $raw.Hash;
+			for @locations -> $location {
+				my %current = self!revision($location.value.Str);
+				next if %current<token> eq %expected{$location.key};
+				die "Stale filesystem observation for '{$location.value}': "
+					~ "the expected revision no longer matches. Re-read or stat the path, "
+					~ 'then reacquire its lease before trying again';
+			}
+		}
+
+		my $text = action();
+		self!tool-result($text, @locations);
+	}
+}
+
+method !tool-result(Str:D $text, @locations --> Hash:D) {
+	my %revisions;
+	for @locations -> $location {
+		%revisions{$location.key} = self!revision($location.value.Str);
+	}
+	%(
+		content => [%( type => 'text', :$text ),],
+		structuredContent => %(
+			revisionScheme => REVISION-SCHEME,
+			revisions => %revisions,
+		),
+	);
+}
+
+# A revision is about bytes and tree identity, never mtimes.  Directory input
+# is a length-framed, path-sorted list so neither traversal order nor ambiguous
+# separators can change the digest.  Symlinks are recorded as links and are not
+# followed, matching the recursive tool safety policy.
+method !revision(Str:D $rel --> Hash:D) {
+	my $path = self!resolve($rel);
+	return %( state => 'absent', token => REVISION-SCHEME ~ ':absent' )
+		unless $path.e || $path.l;
+
+	if $path.f && !$path.l {
+		my $bytes = try $path.slurp(:bin);
+		die "Could not compute revision for '$rel': {error-line($!)}" without $bytes;
+		return %(
+			state => 'file',
+			token => REVISION-SCHEME ~ ':file:' ~ sha256-hex($bytes),
+		);
+	}
+
+	if $path.d && !$path.l {
+		my @records;
+		self!revision-tree($path, '', @records);
+		return %(
+			state => 'directory',
+			token => REVISION-SCHEME ~ ':directory:'
+				~ sha256-hex(@records.sort.join.encode('utf-8')),
+		);
+	}
+
+	# A direct path may name an in-root symlink. Its target text is what can
+	# change without altering its display name; hash that text, not the target.
+	if $path.l {
+		my $target = try nqp::readlink($path.Str);
+		die "Could not compute revision for symlink '$rel': {error-line($!)}"
+			without $target;
+		return %(
+			state => 'symlink',
+			token => REVISION-SCHEME ~ ':symlink:' ~ sha256-hex($target.Str),
+		);
+	}
+
+	%(
+		state => 'other',
+		token => REVISION-SCHEME ~ ':other:' ~ sha256-hex($path.Str),
+	);
+}
+
+method !revision-tree(IO::Path:D $dir, Str:D $prefix, @records is raw --> Nil) {
+	my $entries = try $dir.dir.List;
+	die "Could not compute directory revision for '{$dir.basename}': {error-line($!)}"
+		without $entries;
+
+	for $entries.sort(*.basename) -> $entry {
+		my $name = $prefix.chars ?? "$prefix/{$entry.basename}" !! $entry.basename;
+		my $framed = $name.encode('utf-8').bytes ~ ':' ~ $name ~ ':';
+		if $entry.l {
+			my $target = try nqp::readlink($entry.Str);
+			die "Could not compute directory revision at '$name': {error-line($!)}"
+				without $target;
+			@records.push: 'L:' ~ $framed ~ sha256-hex($target.Str);
+		}
+		elsif $entry.d {
+			@records.push: 'D:' ~ $framed;
+			self!revision-tree($entry, $name, @records);
+		}
+		elsif $entry.f {
+			my $bytes = try $entry.slurp(:bin);
+			die "Could not compute directory revision at '$name': {error-line($!)}"
+				without $bytes;
+			@records.push: 'F:' ~ $framed ~ $bytes.bytes ~ ':' ~ sha256-hex($bytes);
+		}
+		else {
+			@records.push: 'O:' ~ $framed;
+		}
+	}
 }
 
 # === Tool implementations ===
@@ -486,6 +715,106 @@ method !grep-files(
 
 	return ("No matches for '$pattern' under '$rel'", |@notices).join("\n") unless @out.elems;
 	(|@out, |(@notices.elems ?? ('', |@notices) !! ())).join("\n");
+}
+
+method !map-repo(Str:D $rel, Str:D $query, Str:D $focus, Int:D $max-chars --> Str:D) {
+	my $dir = self!resolve($rel);
+	die "Directory not found: '$rel'" unless $dir.e;
+	die "'$rel' is not a directory; map the directory it lives in instead"
+		unless $dir.d;
+
+	# Paths in the map are relative to the ROOT, not to the mapped directory,
+	# so a path in the map can be handed straight back to the read tool.
+	my @base = relative-parts($!root, $dir);
+	my @focus-paths = focus-paths($focus);
+
+	$!map-lock.protect: {
+		my $scanner = Scanner.new;
+		LEAVE { $scanner.dispose if $scanner.defined }
+
+		my ($files, $stopped) = collect-map-files($dir, $!root, MAP-FILE-LIMIT);
+		my %tags;
+		my Int:D $skipped = 0;
+
+		for $files.list -> %file {
+			my $entry = %file<io>;
+
+			# Cheapest test first, and it is only a name: a tree is mostly
+			# files the map has no way to read, and none of them get opened.
+			my Str $lang = lang-for($entry.basename);
+			without $lang {
+				$skipped++;
+				next;
+			}
+
+			my Int:D $size = ((try $entry.s) // 0).Int;
+			if $size > MAP-MAX-FILE-BYTES {
+				$skipped++;
+				next;
+			}
+
+			# The cache is what makes the second map of a working tree
+			# nearly free, which is the case that matters: an agent maps,
+			# edits one file, and maps again.  mtime alone would miss an
+			# edit that landed inside one filesystem timestamp tick, so the
+			# size has to match too.
+			my Str:D $key = $entry.absolute;
+			my $mtime = (try $entry.modified) // Instant;
+			my $cached = %!map-cache{$key};
+			my Str:D $path = (|@base, |%file<parts>).join('/');
+			if $cached.defined && $cached<tags>.defined
+			&& $cached<size> == $size
+			&& $mtime.defined && $cached<mtime>.defined
+			&& $cached<mtime> == $mtime {
+				%tags{$path} = $cached<tags>;
+				next;
+			}
+
+			my $bytes = try $entry.slurp(:bin);
+			without $bytes {
+				$skipped++;   # unreadable: skipped like an unreadable directory
+				next;
+			}
+			if looks-binary($bytes) {
+				$skipped++;
+				next;
+			}
+
+			my $tags = try extract-tags($bytes, $lang, $scanner);
+			without $tags {
+				$skipped++;
+				next;
+			}
+			%!map-cache{$key} = %( :$mtime, :$size, :$tags );
+			%tags{$path} = $tags;
+		}
+
+		my %ranked = rank-files(%tags, $query, @focus-paths);
+		my @ordered = order-files(%tags, %ranked<ranks>);
+		my @blocks = @ordered.map(-> $path {
+			%(
+				:$path,
+				defs => order-defs(%tags{$path}, %ranked<weights>).Array,
+			);
+		});
+
+		my @seeds;
+		@seeds.push: 'query' if query-words($query);
+		@seeds.push: 'focus' if @focus-paths;
+
+		# Parenthesised on purpose: a reduction is a list operator, and an
+		# unparenthesised one inside a hash literal swallows every pair to
+		# its right.
+		my Int:D $definitions = ([+] @blocks.map({ .<defs>.elems })) // 0;
+
+		render-map(@blocks, $max-chars, %(
+			mapped      => %tags.elems,
+			skipped     => $skipped,
+			definitions => $definitions,
+			seeds       => @seeds,
+			stopped     => $stopped,
+		));
+	}
 }
 
 method !move-path(Str:D $from-rel, Str:D $to-rel --> Str:D) {
@@ -767,6 +1096,56 @@ my sub walk-tree(IO::Path:D $dir, &visit --> Nil) {
 		True;
 	}
 	walk($dir, ());
+}
+
+#| The map tool's own walk: every file below $dir that is worth considering,
+#| each as C<%( io => IO::Path, parts => path parts relative to $dir )>, plus a
+#| flag saying whether the file limit cut the walk short.
+#|
+#| Not written in terms of walk-tree, and deliberately so.  A map has to PRUNE
+#| — never descend node_modules, never descend .git — and walk-tree has no way
+#| to express that: its &visit returning False aborts the entire walk, not one
+#| subtree, and glob and grep depend on exactly that meaning.  The traversal
+#| discipline is otherwise identical: sorted names within each directory so two
+#| maps of one tree agree, unreadable directories skipped rather than fatal,
+#| and symlinked directories never descended.  A symlinked FILE is checked the
+#| way grep checks one — chased to its physical destination and dropped if that
+#| lands outside the root — so a planted link cannot put foreign code in the map.
+my sub collect-map-files(IO::Path:D $dir, IO::Path:D $root, Int:D $limit) {
+	my @found;
+	my Bool:D $stopped = False;
+
+	my sub walk(IO::Path:D $here, @rel --> Nil) {
+		my $entries = try $here.dir.List;
+		return without $entries;
+
+		for $entries.sort(*.basename).list -> $entry {
+			last if $stopped;
+			my @parts = (|@rel, $entry.basename);
+
+			if $entry.d {
+				next if $entry.l || prunable-dir($entry.basename);
+				walk($entry, @parts);
+				next;
+			}
+			next unless $entry.f;
+
+			if $entry.l {
+				my $physical = try physical-path($entry);
+				next without $physical;
+				next unless path-contains($root, $physical);
+			}
+
+			if @found.elems >= $limit {
+				$stopped = True;
+				last;
+			}
+			@found.push: %( io => $entry, parts => @parts.List );
+		}
+	}
+
+	walk($dir, ());
+	(@found.List, $stopped);
 }
 
 #| Decode bytes as UTF-8, or return an undefined Str and say why in $why.

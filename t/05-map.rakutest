@@ -1,0 +1,502 @@
+use Test;
+use lib 'lib';
+use lib 't/lib';
+use FSTest;
+use MCP::Server;
+use MCP::Server::Tool::FileSystem;
+use MCP::Server::Tool::FileSystem::Map;
+
+# The map tool, driven the way a client drives it.  Every assertion here is
+# about a tree that was built a few lines above it: the ranking is computed
+# over the whole fixture at once, so a fixture that drifts silently turns
+# these into tests of nothing.
+#
+# The fixture is built so its answers are not close calls.  hub.py is referred
+# to from four files in four languages and refers to nobody; leaf.go is
+# referred to by nothing at all.  Nothing here depends on a rank margin small
+# enough for a floating-point wobble to flip.
+
+plan 14;
+
+my $sandbox = make-sandbox('map');
+END nuke($sandbox);
+
+# --- the fixture ------------------------------------------------------------
+
+my constant HUB-PY = q:to/PY/;
+	def frobnicate(value):
+	    return value + 1
+
+
+	class Hub:
+	    def dispatch(self, value):
+	        return frobnicate(value)
+	PY
+
+my constant A-C = q:to/C/;
+	#include <stdlib.h>
+
+	int run_c(int value)
+	{
+		return frobnicate(value);
+	}
+	C
+
+my constant B-JS = q:to/JS/;
+	export function runJs(value) {
+	  return frobnicate(value);
+	}
+	JS
+
+my constant D-TS = q:to/TS/;
+	export function runTs(value: number): number {
+	  return frobnicate(value);
+	}
+	TS
+
+my constant C-RAKU = q:to/RAKU/;
+	use Lib::Mod;
+
+	my constant BATCH = 4;
+
+	class Runner {
+		method run($value) {
+			# frobnicate is not called here; the line below calls it.
+			helper(frobnicate($value));
+		}
+	}
+
+	#|( Build a closure that expands a value. It hands back a
+	    sub so callers can apply it to several fields without
+	    repeating themselves, and it mentions class Leaked and
+	    my constant LEAKED on the way past. )
+	sub helper($value) { $value }
+
+	my token digits { \d+ }
+	RAKU
+
+my constant MOD-RAKUMOD = q:to/RAKU/;
+	unit module Lib::Mod;
+
+	sub mod-entry($value) is export { $value }
+	RAKU
+
+my constant EXTRA-GO = q:to/GO/;
+
+	func Extra(value int) int {
+		return value
+	}
+	GO
+
+my constant LEAF-GO = q:to/GO/;
+	package leaf
+
+	func Unreferenced(value int) int {
+		return value
+	}
+	GO
+
+# Never written to disk: these two feed the scanner and the ranking directly,
+# where the assertions are about which lines are code and which name is worth
+# printing, not about walking a tree.
+my constant DECLARATOR-DOCS = q:to/RAKU/;
+	#| A one-line declarator comment mentioning sub leaked-one.
+	#= A trailing one-liner mentioning class LeakedTwo.
+	#|( Build a closure that expands a value. It hands back a
+	    sub so callers can apply it to several fields without
+	    repeating themselves, and it mentions class Leaked and
+	    my constant LEAKED as it goes. )
+	sub expander($value) { $value }
+
+	method real-method($value) { $value }   #=( A trailing block that runs on
+	    for another line mentioning sub leaked-three before it closes. )
+
+	my token wanted { \w+ }
+	RAKU
+
+my constant COMMON-ONE = q:to/PY/;
+	def new(config):
+	    return config
+
+
+	def frobnicate_widget(widget):
+	    return widget
+	PY
+
+my constant COMMON-TWO = q:to/PY/;
+	def new(config):
+	    return config
+	PY
+
+my constant COMMON-USER = q:to/PY/;
+	def run(config):
+	    first = new(config)
+	    second = new(config)
+	    third = new(config)
+	    fourth = new(config)
+	    return frobnicate_widget(first), frobnicate_widget(second)
+	PY
+
+my constant CALLER-NEW = q:to/PY/;
+	def call_it(config):
+	    return new(config)
+	PY
+
+my constant CALLER-BOTH = q:to/PY/;
+	def call_it(config):
+	    return frobnicate_widget(new(config))
+	PY
+
+sub put(IO::Path:D $path, Str:D $text) {
+	$path.parent.mkdir;
+	$path.spurt($text);
+	$path;
+}
+
+my $tree = $sandbox.add('tree');
+put($tree.add('hub.py'), HUB-PY);
+put($tree.add('a.c'), A-C);
+put($tree.add('b.js'), B-JS);
+put($tree.add('d.ts'), D-TS);
+put($tree.add('c.raku'), C-RAKU);
+put($tree.add('lib').add('Lib').add('Mod.rakumod'), MOD-RAKUMOD);
+put($tree.add('leaf.go'), LEAF-GO);
+# Pruned entirely: a vendored copy of the world outranks the code that uses it.
+put($tree.add('node_modules').add('junk.js'),
+	q:to/JS/);
+	export function junk() { return frobnicate(0); }
+	JS
+# Skipped and counted, three different ways: an extension the map cannot read,
+# a file that claims to be Python and is not text, and prose.
+$tree.add('blob.bin').spurt(Buf.new(0x89, 0x50, 0x00, 0x01, 0x61, 0x6c));
+$tree.add('payload.py').spurt(Buf.new(0x64, 0x65, 0x66, 0x00, 0x00, 0x0a));
+put($tree.add('notes.txt'), "prose, not code\n");
+
+# Two-file trees, one per language whose call edges come from this pack's own
+# supplemental queries rather than from a vendored tags.scm.  In each, the
+# caller sorts BEFORE hub.py by name, so hub.py coming first can only be the
+# edge talking.
+for <c js ts> Z <a.c b.js d.ts> -> ($lang, $caller) {
+	my $dir = $sandbox.add('edges').add($lang);
+	put($dir.add('hub.py'), HUB-PY);
+	put($dir.add($caller), %( 'a.c' => A-C, 'b.js' => B-JS, 'd.ts' => D-TS ){$caller});
+}
+
+$sandbox.add('empty').mkdir;
+
+sub fs-server() {
+	my $server = MCP::Server.new(:name<fs-map>);
+	$server.plug: MCP::Server::Tool::FileSystem.new(:root($sandbox), :read-only);
+	$server;
+}
+
+# A quoted-key pair is a POSITIONAL Pair in Raku, not a named argument, so
+# the arguments travel as a hash the way call-tool takes them.
+sub map-text($server, %args --> Str) {
+	my %response = call-tool($server, 'fs_map', %args);
+	return "ERROR: {result-text(%response)}" if result-errored(%response);
+	result-text(%response);
+}
+
+#| Ranking is deterministic, so asking for it repeatedly is free of surprises
+#| and keeps the assertions below reading as one thought each.
+sub ranked-of(%tags --> Hash) { rank-files(%tags, '', ()) }
+
+#| The block headers of a map, in the order they were printed.
+sub blocks(Str:D $text --> List) {
+	$text.lines.grep({
+		.chars && $_ ne '⋮' && !.starts-with('  ') && !.starts-with('[')
+	}).map(*.chop).List;
+}
+
+# --- the tests --------------------------------------------------------------
+
+subtest 'The most-referenced file leads the map' => {
+	plan 4;
+	my $text = map-text(fs-server(), { path => 'tree', 'max-chars' => 65536 });
+	my @blocks = blocks($text);
+	is @blocks.head, 'tree/hub.py',
+		'hub.py leads: four files refer to it and it refers to none of them';
+	is @blocks.tail, 'tree/leaf.go', 'leaf.go trails: nothing refers to it';
+	ok $text.contains('  1: def frobnicate(value):'), 'Definitions carry their 1-based line';
+	nok $text.contains('return value + 1'), 'Bodies never appear';
+};
+
+subtest 'C call edges reach the hub' => {
+	plan 2;
+	# The vendored c tags.scm has no reference captures at all; without this
+	# pack's supplemental query, a.c would refer to nothing and the two files
+	# would tie — and a tie is broken by name, which a.c wins.
+	my $text = map-text(fs-server(), { path => 'edges/c', 'max-chars' => 65536 });
+	is blocks($text).head, 'edges/c/hub.py', 'hub.py outranks the C file that calls it';
+	ok $text.contains('edges/c/a.c:'), 'And the C file is still on the map';
+};
+
+subtest 'JavaScript and TypeScript call edges reach the hub' => {
+	plan 3;
+	is blocks(map-text(fs-server(), { path => 'edges/js', 'max-chars' => 65536 })).head,
+		'edges/js/hub.py', 'hub.py outranks the JavaScript file that calls it';
+
+	# typescript's tags.scm tags class and type references and no calls at
+	# all, so this edge is the supplemental query's too — and so is the
+	# definition below, since that same file tags only signature forms and
+	# would miss every TypeScript function that has a body.
+	my $text = map-text(fs-server(), { path => 'edges/ts', 'max-chars' => 65536 });
+	is blocks($text).head, 'edges/ts/hub.py',
+		'hub.py outranks the TypeScript file that calls it';
+	ok $text.contains('export function runTs(value: number): number {'),
+		'A TypeScript function with a body is a definition on the map';
+};
+
+subtest 'Raku files are read by the heuristic scanner' => {
+	plan 9;
+	my $text = map-text(fs-server(), { path => 'tree', 'max-chars' => 65536 });
+	ok $text.contains('sub helper($value) { $value }'), 'sub';
+	ok $text.contains('method run($value) {'), 'method';
+	ok $text.contains('class Runner {'), 'class';
+	ok $text.contains('my token digits { \d+ }'), 'token';
+	ok $text.contains('my constant BATCH = 4;'), 'constant';
+	ok $text.contains('unit module Lib::Mod;'), 'unit module';
+
+	# The continuation lines of a `#|( … )` block carry no '#', so a scanner
+	# that skipped comments line by line would read prose about code as code
+	# — and prose about code says `sub`, `class` and `constant` constantly.
+	nok $text.contains('callers can apply'),
+		'A declarator block running across lines is documentation throughout';
+	nok $text.contains('LEAKED'), 'Including the declaration-shaped words inside it';
+
+	# `use Lib::Mod` is an edge to the file that IS Lib::Mod, resolved through
+	# the lib/Foo/Bar.rakumod <-> Foo::Bar index rather than by reading it.
+	my @blocks = blocks($text);
+	ok @blocks.first('tree/lib/Lib/Mod.rakumod', :k) < @blocks.first('tree/leaf.go', :k),
+		'A used module outranks a module nothing uses';
+};
+
+subtest 'A small budget drops whole files rather than cutting lines' => {
+	plan 6;
+	my $text = map-text(fs-server(), { path => 'tree', 'max-chars' => 512 });
+	ok $text.chars <= 512, 'The map fits the budget it was given';
+
+	# Swept rather than sampled at one size: the summary grows when the map
+	# is cut — it gains the clause saying so — and a budget that reserved for
+	# the shorter summary would overrun by exactly the length of its own
+	# apology, at some sizes and not others.
+	my @over = (512, 600, 700, 800, 900, 1000, 1200, 1500, 2000, 3000).grep(-> $limit {
+		map-text(fs-server(), { path => 'tree', 'max-chars' => $limit }).chars > $limit
+	});
+	is-deeply @over.List, (), 'And fits it at every size, not just the one asserted above';
+	ok $text.contains('tree/hub.py:'), 'The top-ranked file survives';
+	nok $text.contains('tree/leaf.go:'), 'The bottom-ranked file does not';
+	ok $text.lines.tail.starts-with('[mapped '), 'The summary is still last';
+
+	# Every printed definition is a whole line of the file it came from: a
+	# half-line would read like a signature that is not really there.
+	my Str $path;
+	my Bool:D $whole = True;
+	for $text.lines -> $line {
+		if $line ~~ /^ '  ' $<line> = [\d+] ': ' $<text> = [.*] $/ {
+			my $file = $sandbox;
+			$file .= add($_) for $path.split('/');
+			my $source = $file.slurp.lines[$/<line>.Int - 1] // '';
+			$whole = False unless $source.trim eq ~$/<text>;
+		}
+		elsif $line ne '⋮' && !$line.starts-with('[') {
+			$path = $line.chop;
+		}
+	}
+	ok $whole, 'And every printed line is the whole source line, trimmed';
+};
+
+subtest 'Pruned directories and unreadable files never reach the map' => {
+	plan 4;
+	my $text = map-text(fs-server(), { path => 'tree', 'max-chars' => 65536 });
+	nok $text.contains('junk'), 'node_modules is pruned, not ranked';
+	nok $text.contains('blob.bin'), 'A file the map cannot read is not on it';
+	nok $text.contains('payload.py'), 'Nor is a file that claims an extension it does not honour';
+	is $text.lines.tail,
+		'[mapped 7 files (3 skipped: unsupported/binary/too-large), 14 definitions; '
+			~ 'ranked by references]',
+		'The summary counts everything that was left out';
+};
+
+subtest 'Parse results are cached per file' => {
+	plan 3;
+	my $server = fs-server();
+	map-text($server, { path => 'tree', 'max-chars' => 65536 });
+
+	my $before = $MCP::Server::Tool::FileSystem::Map::PARSE-COUNT;
+	map-text($server, { path => 'tree', 'max-chars' => 65536 });
+	is $MCP::Server::Tool::FileSystem::Map::PARSE-COUNT, $before,
+		'A second map of an unchanged tree parses nothing at all';
+
+	# Length as well as content, so the cache is invalidated on a filesystem
+	# whose timestamps are too coarse to notice a fast rewrite.
+	$tree.add('leaf.go').spurt(LEAF-GO ~ EXTRA-GO);
+	my $text = map-text($server, { path => 'tree', 'max-chars' => 65536 });
+	is $MCP::Server::Tool::FileSystem::Map::PARSE-COUNT, $before + 1,
+		'Rewriting one file reparses exactly that file';
+	ok $text.contains('func Extra(value int) int {'), 'And the new definition is on the map';
+
+	$tree.add('leaf.go').spurt(LEAF-GO);
+};
+
+subtest 'query and focus steer the ranking' => {
+	plan 4;
+	my $plain = blocks(map-text(fs-server(), { path => 'tree', 'max-chars' => 65536 }));
+	is $plain.tail, 'tree/leaf.go', 'Unseeded, the unreferenced file is last';
+
+	my $seeded = map-text(fs-server(), { path => 'tree', 'max-chars' => 65536,
+		query => 'unreferenced' });
+	is blocks($seeded).head, 'tree/leaf.go',
+		'A query matching one of its definitions lifts it to the top';
+	ok $seeded.lines.tail.contains('seeded by query'), 'And the summary says the map was seeded';
+
+	my $focused = map-text(fs-server(), { path => 'tree', 'max-chars' => 65536,
+		focus => 'tree/lib/Lib/Mod.rakumod' });
+	is blocks($focused).head, 'tree/lib/Lib/Mod.rakumod',
+		'A focused path outranks the hub everything calls';
+};
+
+subtest 'CRLF files and Pod blocks are read correctly' => {
+	plan 5;
+	# The pack's own line-ending discipline applies here too.  On the Raku
+	# side "\r\n" is a single grapheme, so line numbering cannot drift; on the
+	# tree-sitter side the offsets are BYTES, so the arithmetic that finds a
+	# definition's line has to be byte arithmetic or it lands elsewhere.
+	my $dir = $sandbox.add('crlf');
+	$dir.mkdir;
+	$dir.add('windows.rakumod').spurt(q:to/RAKU/.subst("\n", "\r\n", :g).encode('utf-8'));
+		=begin pod
+		sub not-a-sub-really() { }
+		=end pod
+
+		sub real-one() { }
+		RAKU
+	$dir.add('windows.c').spurt(q:to/C/.subst("\n", "\r\n", :g).encode('utf-8'));
+		int run_crlf(int value)
+		{
+			return value;
+		}
+		C
+
+	my $text = map-text(fs-server(), { path => 'crlf', 'max-chars' => 65536 });
+	ok $text.contains('  5: sub real-one() { }'),
+		'A CRLF Raku definition is found at the line a reader would count';
+	nok $text.contains('not-a-sub-really'),
+		'A declaration inside a Pod block is documentation, not a definition';
+	ok $text.contains('  1: int run_crlf(int value)'),
+		'A CRLF C definition is found by byte offset, not by grapheme offset';
+	nok $text.contains("\r"), 'And no carriage return survives into the map';
+	nok $text.contains('return value;'), 'Bodies still do not appear';
+};
+
+subtest 'Every form of declarator documentation is skipped' => {
+	plan 6;
+	# Asserted against the scanner rather than through a map: what is being
+	# pinned here is which lines are code, and a rendered map only shows the
+	# ones that survived the budget.
+	my $scanner = Scanner.new;
+	LEAVE $scanner.dispose;
+
+	my %tags = extract-tags(DECLARATOR-DOCS.encode('utf-8'), 'raku', $scanner);
+	my @names = %tags<defs>.map(*.<name>).sort.List;
+	is-deeply @names.List, ('expander', 'real-method', 'wanted'),
+		'Only the three real declarations are definitions';
+
+	# Named individually as well as collectively, because each is a separate
+	# way for prose to be mistaken for code.
+	nok @names.first('leaked-one').defined, 'A one-line #| comment declares nothing';
+	nok @names.first('LeakedTwo').defined, 'Nor does a one-line #= comment';
+	nok @names.first('so').defined,
+		'Nor does a continuation line of a multi-line #|( … ) block';
+	nok @names.first('leaked-three').defined,
+		'Nor does one of a #=( … ) block opened after code on its line';
+
+	# The prose is not merely un-declared, it is not read at all: its words
+	# would otherwise turn up as references and pull the ranking around.
+	nok %tags<refs>.keys.first({ .contains('callers') || .contains('eaked') }).defined,
+		'And none of that prose contributes references either';
+};
+
+subtest 'A name defined in many files does not win every file' => {
+	plan 4;
+	my $scanner = Scanner.new;
+	LEAVE $scanner.dispose;
+
+	my %tags;
+	%tags{'one.py'}   = extract-tags(COMMON-ONE.encode('utf-8'), 'python', $scanner);
+	%tags{'two.py'}   = extract-tags(COMMON-TWO.encode('utf-8'), 'python', $scanner);
+	%tags{'three.py'} = extract-tags(COMMON-TWO.encode('utf-8'), 'python', $scanner);
+	%tags{'user.py'}  = extract-tags(COMMON-USER.encode('utf-8'), 'python', $scanner);
+	my %ranked = rank-files(%tags, '', ());
+
+	# `new` is the most-referenced name in the corpus, four calls to two...
+	is %ranked<references><new>, 4, 'new is referenced four times';
+	is %ranked<references><frobnicate_widget>, 2, 'and the distinctive symbol twice';
+
+	# ...but three files define it and one file defines the other, so a
+	# reference to `new` is worth a third of a reference to the symbol only
+	# one file could have meant.
+	ok %ranked<weights><new> < %ranked<weights><frobnicate_widget>,
+		'Sharing a name among its definers reverses which is worth more';
+
+	is order-defs(%tags<one.py>, %ranked<weights>).head<name>, 'frobnicate_widget',
+		'So the file that defines both leads with the one that identifies it';
+};
+
+subtest 'A name most of the map refers to identifies none of it' => {
+	plan 4;
+	# The other half of the same problem, and the half that bites in a real
+	# tree: `new` is declared ONCE and called from everywhere, so sharing it
+	# among its definers changes nothing.  What disqualifies it is breadth —
+	# an unqualified reference scan cannot tell whose `new` it is looking at,
+	# and a name three quarters of the files mention is not telling anyone
+	# which file to read.
+	my $scanner = Scanner.new;
+	LEAVE $scanner.dispose;
+
+	my %tags;
+	%tags{'one.py'} = extract-tags(COMMON-ONE.encode('utf-8'), 'python', $scanner);
+	for 1 .. 9 -> $i {
+		my Str:D $name = 'caller' ~ $i ~ '.py';
+		%tags{$name} = extract-tags(
+			($i <= 2 ?? CALLER-BOTH !! CALLER-NEW).encode('utf-8'), 'python', $scanner);
+	}
+
+	is ranked-of(%tags)<references><new>, 9,
+		'new is referred to from nine of the ten files';
+	is ranked-of(%tags)<weights><new>, 1e0,
+		'And is worth no more than a definition nothing refers to at all';
+	is order-defs(%tags<one.py>, ranked-of(%tags)<weights>).head<name>, 'frobnicate_widget',
+		'So the file that declares it leads with the name that identifies it';
+
+	# The rule is evidence, not superstition: in a map too small for breadth
+	# to mean anything, the same shape is left alone.
+	my %small = %tags.grep({ .key eq 'one.py' || .key le 'caller3.py' }).Hash;
+	is ranked-of(%small)<weights><new>, 3e0,
+		'In a map of four files, being referred to by three of them still counts';
+};
+
+subtest 'An empty directory maps to its summary' => {
+	plan 2;
+	my $text = map-text(fs-server(), { path => 'empty' });
+	is $text, '[mapped 0 files, 0 definitions; ranked by references]',
+		'Nothing to map is an answer, not an error';
+	is $text.lines.elems, 1, 'And nothing else is printed';
+};
+
+subtest 'The map refuses what it cannot map' => {
+	plan 4;
+	my $server = fs-server();
+	errors-with $server, 'fs_map', { path => 'tree/hub.py' },
+		'is not a directory', 'Mapping a file is an error result';
+	errors-with $server, 'fs_map', { path => 'tree/nope' },
+		"Directory not found: 'tree/nope'", 'Mapping a missing directory is an error result';
+	errors-with $server, 'fs_map', { path => 'tree', 'max-chars' => 100000 },
+		"Parameter 'max-chars' must be at most 65536", 'max-chars has a ceiling';
+	errors-with $server, 'fs_map', { path => 'tree', 'max-chars' => True },
+		"Parameter 'max-chars' must be a whole number, not a boolean",
+		'A boolean is not quietly read as a budget';
+};
+
+done-testing;

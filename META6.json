@@ -6,14 +6,17 @@
   "build-depends": [
   ],
   "depends": [
-    "MCP::Server:auth<zef:apogee>"
+    "Digest::SHA256::Native:ver<1.0.0+>:auth<zef:bduggan>",
+    "MCP::Server:ver<0.4.0+>:auth<zef:apogee>",
+    "TreeSitter::Native:ver<0.1.0+>:auth<zef:apogee>"
   ],
   "description": "Root-confined filesystem tools for MCP::Server",
   "license": "Artistic-2.0",
   "name": "MCP::Server::Tool::FileSystem",
   "perl": "6.d",
   "provides": {
-    "MCP::Server::Tool::FileSystem": "lib/MCP/Server/Tool/FileSystem.rakumod"
+    "MCP::Server::Tool::FileSystem": "lib/MCP/Server/Tool/FileSystem.rakumod",
+    "MCP::Server::Tool::FileSystem::Map": "lib/MCP/Server/Tool/FileSystem/Map.rakumod"
   },
   "resources": [
   ],
@@ -26,5 +29,5 @@
   ],
   "test-depends": [
   ],
-  "version": "0.1.1"
+  "version": "0.2.0"
 }

@@ -2,6 +2,47 @@ Revision history for MCP::Server::Tool::FileSystem
 
 {{$NEXT}}
 
+0.2.0  2026-08-20T22:49:48+01:00
+    - New reading tool: map(path, query, focus, max-chars). Returns a ranked
+      skeleton of the code below a directory — each file as its path plus the
+      definition lines of its most-referenced symbols, never bodies — so a
+      model can orient in an unfamiliar tree with one call instead of a dozen
+      speculative reads. Ranking is a personalized PageRank over the
+      "file A refers to something file B defines" graph; query re-centres it on
+      matching identifiers and focus on named paths. Registered on read-only
+      kits too.
+    - map understands C, C++, Go, Java, JavaScript, Python, Rust, TypeScript
+      and TSX through TreeSitter::Native, and Raku through a heuristic scanner
+      (no tree-sitter grammar for Raku exists), where `use Foo::Bar` resolves
+      to the file that is Foo::Bar. The pack ships supplemental tree-sitter
+      queries for C and C++ (whose vendored tags.scm files tag no references at
+      all) and for TypeScript/TSX (whose vendored file tags only signature
+      declarations, missing every function with a body).
+    - map picks a file's representative definitions by how much the tree refers
+      to them, sharing a name's references among the files that define it and
+      setting aside names most of the map refers to. Matched-by-name references
+      cannot tell whose `new` they mean, and counting them naively made
+      "method new" the single line printed for three unrelated files.
+    - map's Raku scanner skips declarator documentation in every form, the
+      bracketed `#|( ... )` and `#=( ... )` blocks included. Their continuation
+      lines carry no `#`, so prose about code — which says "sub", "class" and
+      "constant" constantly — was being read as code and could outrank the
+      declarations around it.
+    - map bounds itself: prunes .git, node_modules, build output and every
+      dot-directory; skips files over 1MB, binaries and unreadable files, and
+      counts them; stops after 5000 files; and fits its answer into max-chars
+      by dropping whole files rather than truncating one. Parse results are
+      cached per file on modification time and size, so mapping, editing one
+      file and mapping again re-reads only that file.
+    - New dependency: TreeSitter::Native.
+    - Tool results now include structured `sha256-v1` revisions while preserving
+      their existing text. Files hash exact bytes; directories hash a canonical
+      recursive tree; absent paths have a stable token.
+    - SECURITY: write, edit, mkdir, move and delete accept the unadvertised
+      `_expected-revisions` condition. Compare and mutation share one provider
+      lock, stale conditions perform no mutation, and concurrent conditional
+      writers cannot both win.
+
 0.1.1  2026-08-09T20:26:49+01:00
     - SECURITY: symlink containment now holds on Windows. The defence relied
       on IO::Path.resolve, which does not follow symlinks there, so a link

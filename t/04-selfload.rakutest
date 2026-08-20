@@ -22,7 +22,7 @@ subtest 'Bare name in :tools resolves under MCP::Server::Tool::' => {
 		:tools['FileSystem' => { root => $sandbox.Str, prefix => 'sb' }],
 	);
 	is-deeply tool-names($server),
-		<sb_delete sb_edit sb_glob sb_grep sb_list sb_mkdir sb_move sb_read sb_stat sb_write>.list,
+		<sb_delete sb_edit sb_glob sb_grep sb_list sb_map sb_mkdir sb_move sb_read sb_stat sb_write>.list,
 		'Toolkit loaded by name and namespaced by the reserved prefix key';
 
 	my %response = call-tool($server, 'sb_read', { path => 'hello.txt' });
@@ -36,7 +36,7 @@ subtest 'Config keys travel through :tools' => {
 		:name<t>,
 		:tools['FileSystem' => { root => $sandbox.Str, 'read-only' => True }],
 	);
-	is-deeply tool-names($server), <fs_glob fs_grep fs_list fs_read fs_stat>.list,
+	is-deeply tool-names($server), <fs_glob fs_grep fs_list fs_map fs_read fs_stat>.list,
 		'read-only reaches the pack and drops the mutating tools';
 	is result-text(call-tool($server, 'fs_read', { path => 'hello.txt' })),
 		'hello from the sandbox', 'Default prefix applies when none is configured';

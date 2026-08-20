@@ -9,7 +9,7 @@ use MCP::Server::Tool::FileSystem;
 # so the expected strings below are output format rather than host paths.
 # Everything that touches the disk is built with IO::Path.add.
 
-plan 13;
+plan 15;
 
 my $sandbox = make-sandbox('tools');
 END nuke($sandbox);
@@ -34,13 +34,13 @@ sub fs-server(Str :$prefix, Bool:D :$read-only = False) {
 subtest 'Prefixing' => {
 	plan 3;
 	is-deeply tool-names(fs-server()),
-		<fs_delete fs_edit fs_glob fs_grep fs_list fs_mkdir fs_move fs_read fs_stat fs_write>.list,
+		<fs_delete fs_edit fs_glob fs_grep fs_list fs_map fs_mkdir fs_move fs_read fs_stat fs_write>.list,
 		'default-prefix namespaces the tools as fs_*';
 	is-deeply tool-names(fs-server(:prefix<box>)),
-		<box_delete box_edit box_glob box_grep box_list box_mkdir box_move box_read box_stat box_write>.list,
+		<box_delete box_edit box_glob box_grep box_list box_map box_mkdir box_move box_read box_stat box_write>.list,
 		'Explicit :prefix wins over default-prefix';
 	is-deeply tool-names(fs-server(:prefix(''))),
-		<delete edit glob grep list mkdir move read stat write>.list,
+		<delete edit glob grep list map mkdir move read stat write>.list,
 		'An empty prefix registers bare names';
 };
 
@@ -376,6 +376,39 @@ subtest 'grep' => {
 		"Path not found: 'scratch/nope'", 'A missing path is an error result';
 };
 
+subtest 'map' => {
+	plan 8;
+	my $server = fs-server();
+	my $dir = $sandbox.add('scratch').add('map');
+	$dir.mkdir;
+	$dir.add('hub.py').spurt("def frobnicate(value):\n    return value + 1\n");
+	$dir.add('user.py').spurt("import hub\n\n\ndef go():\n    return hub.frobnicate(1)\n");
+	$dir.add('notes.txt').spurt("prose, not code\n");
+
+	my %map = call-tool($server, 'fs_map', { path => 'scratch/map' });
+	nok result-errored(%map), 'Mapping a directory succeeds';
+
+	my $text = result-text(%map);
+	ok $text.contains('scratch/map/hub.py:'),
+		'Each block is headed with the path relative to the root, not to the mapped directory';
+	ok $text.contains('  1: def frobnicate(value):'),
+		'A definition is reported as its 1-based line number and the line itself';
+	nok $text.contains('return value + 1'), 'The body of that definition is not';
+	is $text.lines.tail,
+		'[mapped 2 files (1 skipped: unsupported/binary/too-large), 2 definitions; ranked by references]',
+		'The summary comes last and counts what was left out';
+
+	# The tie-break that keeps the tool worth testing at all: hub.py is
+	# referred to by user.py and nothing refers to user.py, so hub.py ranks
+	# first even though it sorts second by name.
+	is $text.lines.head, 'scratch/map/hub.py:', 'The most-referenced file comes first';
+
+	errors-with $server, 'fs_map', { path => 'scratch/map/hub.py' },
+		'is not a directory', 'Mapping a file is an error result';
+	errors-with $server, 'fs_map', { path => 'scratch/map', 'max-chars' => 10 },
+		"Parameter 'max-chars' must be at least 512", 'max-chars has a floor';
+};
+
 subtest 'move' => {
 	plan 14;
 	my $server = fs-server();
@@ -461,6 +494,128 @@ subtest 'delete' => {
 	errors-with $server, 'fs_delete', { path => 'scratch/delete', recursive => 3 },
 		"Parameter 'recursive' must be true or false, not Int",
 		'A number is not quietly read as a flag';
+};
+
+subtest 'structured revisions and conditional mutations' => {
+	plan 28;
+	my $server = fs-server();
+	my $path = $sandbox.add('scratch').add('cas.txt');
+	$path.spurt('one');
+
+	my %read = call-tool($server, 'fs_read', { path => 'scratch/cas.txt' });
+	is result-text(%read), 'one', 'revision metadata does not change read text';
+	is %read<result><structuredContent><revisionScheme>, 'sha256-v1',
+		'the revision scheme is explicit';
+	my %file-rev = %read<result><structuredContent><revisions><path>;
+	is %file-rev<state>, 'file', 'a file observation names its state';
+	like %file-rev<token>, /^ 'sha256-v1:file:' <[0..9a..f]> ** 64 $/,
+		'and carries a SHA-256 byte revision';
+
+	my %decl = $server.handle-request({
+		jsonrpc => '2.0', id => 7, method => 'tools/list',
+	})<result><tools>.first(*<name> eq 'fs_write')<inputSchema><properties>;
+	nok %decl<_expected-revisions>:exists,
+		'the reserved condition is not advertised to the model';
+
+	$path.spurt('external');
+	my %stale = call-tool($server, 'fs_write', {
+		path => 'scratch/cas.txt', content => 'clobber',
+		'_expected-revisions' => { path => %file-rev<token> },
+	});
+	ok result-errored(%stale), 'a stale conditional write is refused';
+	like result-text(%stale), /'Stale filesystem observation'/,
+		'the refusal explains that the observation is stale';
+	is $path.slurp, 'external', 'a refused write has no side effect';
+
+	my %fresh = call-tool($server, 'fs_stat', { path => 'scratch/cas.txt' });
+	my $fresh-token = %fresh<result><structuredContent><revisions><path><token>;
+	my %written = call-tool($server, 'fs_write', {
+		path => 'scratch/cas.txt', content => 'two',
+		'_expected-revisions' => { path => $fresh-token },
+	});
+	nok result-errored(%written), 'a matching conditional write succeeds';
+	is $path.slurp, 'two', 'and performs the write';
+	is %written<result><structuredContent><revisions><path><state>, 'file',
+		'the result advances the target revision';
+
+	my %missing = call-tool($server, 'fs_stat', { path => 'scratch/new-dir' });
+	ok result-errored(%missing), 'stat still reports a missing path as an error';
+	my %made = call-tool($server, 'fs_mkdir', {
+		path => 'scratch/new-dir',
+		'_expected-revisions' => { path => 'sha256-v1:absent' },
+	});
+	nok result-errored(%made), 'the absent token permits conditional creation';
+	is %made<result><structuredContent><revisions><path><state>, 'directory',
+		'and creation returns a directory revision';
+
+	my $dir-token = %made<result><structuredContent><revisions><path><token>;
+	$sandbox.add('scratch').add('new-dir').add('child').spurt('x');
+	my %dir = call-tool($server, 'fs_list', { path => 'scratch/new-dir' });
+	isnt %dir<result><structuredContent><revisions><path><token>, $dir-token,
+		'a recursive directory revision changes with a descendant';
+
+	my $race-token = %written<result><structuredContent><revisions><path><token>;
+	my @race = await (
+		start { call-tool($server, 'fs_write', {
+			path => 'scratch/cas.txt', content => 'left',
+			'_expected-revisions' => { path => $race-token },
+		}) },
+		start { call-tool($server, 'fs_write', {
+			path => 'scratch/cas.txt', content => 'right',
+			'_expected-revisions' => { path => $race-token },
+		}) },
+	);
+	is @race.grep({ !result-errored($_) }).elems, 1,
+		'exactly one simultaneous writer wins the compare-and-mutate lock';
+	is @race.grep({ result-errored($_) }).elems, 1,
+		'and the other gets a stale result';
+	ok $path.slurp eq 'left' || $path.slurp eq 'right',
+		'the winner is the complete final value';
+
+	my $race-value = $path.slurp;
+	my %race-stat = call-tool($server, 'fs_stat', { path => 'scratch/cas.txt' });
+	my %edited = call-tool($server, 'fs_edit', {
+		path => 'scratch/cas.txt', 'old-string' => $race-value, 'new-string' => 'edited',
+		'_expected-revisions' => {
+			path => %race-stat<result><structuredContent><revisions><path><token>,
+		},
+	});
+	nok result-errored(%edited), 'edit honours a matching revision';
+	is $path.slurp, 'edited', 'conditional edit performs exactly its replacement';
+
+	my $movable = $sandbox.add('scratch').add('move-cas.txt');
+	$movable.spurt('move me');
+	my %move-read = call-tool($server, 'fs_read', { path => 'scratch/move-cas.txt' });
+	my %moved = call-tool($server, 'fs_move', {
+		from => 'scratch/move-cas.txt', to => 'scratch/moved-cas.txt',
+		'_expected-revisions' => {
+			from => %move-read<result><structuredContent><revisions><path><token>,
+			to => 'sha256-v1:absent',
+		},
+	});
+	nok result-errored(%moved), 'move checks both source and destination';
+	is %moved<result><structuredContent><revisions><from><state>, 'absent',
+		'the old move location advances to absent';
+	is %moved<result><structuredContent><revisions><to><state>, 'file',
+		'and the destination returns its new revision';
+
+	my %deleted = call-tool($server, 'fs_delete', {
+		path => 'scratch/moved-cas.txt',
+		'_expected-revisions' => {
+			path => %moved<result><structuredContent><revisions><to><token>,
+		},
+	});
+	nok result-errored(%deleted), 'delete checks its matching revision';
+	is %deleted<result><structuredContent><revisions><path><state>, 'absent',
+		'and returns the absent post-delete revision';
+	nok $sandbox.add('scratch').add('moved-cas.txt').e, 'the conditional delete landed';
+
+	my %bad-shape = call-tool($server, 'fs_delete', {
+		path => 'scratch/cas.txt', '_expected-revisions' => 'nope',
+	});
+	ok result-errored(%bad-shape), 'a malformed reserved condition fails closed';
+	like result-text(%bad-shape), /'_expected-revisions'/,
+		'the malformed parameter is named';
 };
 
 done-testing;

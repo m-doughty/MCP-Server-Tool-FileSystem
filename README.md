@@ -5,7 +5,7 @@ MCP::Server::Tool::FileSystem
 
 A root-confined filesystem toolkit for [MCP::Server](https://github.com/m-doughty/MCP-Server).
 
-Give a model a directory, not a machine. The pack registers ten tools — `read`, `write`, `edit`, `list`, `glob`, `grep`, `stat`, `mkdir`, `move` and `delete` — and every path argument they take is interpreted relative to a configured root that no argument can escape.
+Give a model a directory, not a machine. The pack registers eleven tools — `read`, `write`, `edit`, `list`, `glob`, `grep`, `map`, `stat`, `mkdir`, `move` and `delete` — and every path argument they take is interpreted relative to a configured root that no argument can escape.
 
 Synopsis
 --------
@@ -20,7 +20,7 @@ my $server = MCP::Server.new(:name<workspace>, :version<1.0>);
 
 $server.plug: MCP::Server::Tool::FileSystem.new(root => '/srv/notes');
 # Registers fs_read, fs_write, fs_edit, fs_list, fs_glob, fs_grep,
-# fs_stat, fs_mkdir, fs_move, fs_delete
+# fs_map, fs_stat, fs_mkdir, fs_move, fs_delete
 
 $server.run;   # stdin/stdout
 ```
@@ -38,7 +38,7 @@ MCP::Server.new(
     ],
 ).run;
 # notes_read, notes_write, ... and logs_read, logs_list, logs_glob,
-# logs_grep, logs_stat
+# logs_grep, logs_map, logs_stat
 ```
 
 Or skip the Raku entirely and hand `raku-mcp` a config file:
@@ -86,7 +86,7 @@ Configuration
 <th>Key</th> <th>Type</th> <th>Default</th> <th>Meaning</th>
 </tr></thead>
 <tbody>
-<tr> <td>root</td> <td>IO::Path</td> <td>required</td> <td>Directory every path is resolved inside. A plain string is coerced. Must exist and be a directory, or construction dies. Stored resolved.</td> </tr> <tr> <td>read-only</td> <td>Bool</td> <td>False</td> <td>When True, the write, edit, mkdir, move and delete tools are never registered, and stat reports nothing as writable.</td> </tr>
+<tr> <td>root</td> <td>IO::Path</td> <td>required</td> <td>Directory every path is resolved inside. A plain string is coerced. Must exist and be a directory, or construction dies. Stored resolved.</td> </tr> <tr> <td>read-only</td> <td>Bool</td> <td>False</td> <td>When True, the write, edit, mkdir, move and delete tools are never registered, and stat reports nothing as writable. The six reading tools — read, list, glob, grep, map and stat — are unaffected.</td> </tr>
 </tbody>
 </table>
 
@@ -106,6 +106,12 @@ Parameter names in this pack are a contract, not a matter of taste:
   * Multi-word parameters are kebab-case: `old-string`, `new-string`, `replace-all`, `max-results`.
 
 The reason is what sits in front of the server. A permission layer — Claude Code's directory rules, or [MCP::Client::Policy](https://github.com/m-doughty/MCP-Client) — decides whether a call may go through by looking at which files it would touch, and it finds them by name. A tool that called its argument `filename` would sail past a rule written for `path`. If you write a toolkit of your own that is meant to live behind the same guard, use the same names.
+
+### Structured revisions and conditional mutation
+
+`read`, `list`, `stat` and every successful mutator keep their existing text content and additionally return `structuredContent` with `revisionScheme = sha256-v1`. Each location is `absent`, `file`, `directory`, or `symlink` with an opaque token. File tokens hash exact bytes; directory tokens hash a canonical, path-sorted recursive tree description, so a descendant change changes the directory revision.
+
+The five mutators accept a reserved `_expected-revisions` object keyed by `path`, or `from`/`to` for `move`. It is deliberately absent from the advertised schema: an orchestration layer adds it after the model creates the call. When present, every mutation location needs a token. Comparison and the mutation run under one toolkit mutation lock; a mismatch is an `isError` and does nothing. Calls without the reserved argument retain standalone behaviour.
 
 ### read(path, offset?, limit?)
 
@@ -259,6 +265,47 @@ The rest of the parameters bound what comes back:
 
 `grep` is a reading tool: it is registered even when `read-only` is set.
 
+### map(path = '.', query?, focus?, max-chars = 8192)
+
+Returns a ranked skeleton of the code below `path`: the files that matter, each as its path followed by the **definition lines** of its most-referenced symbols. Bodies never appear. It is the tool to reach for before reading anything, and it is the reason not to read twenty files to find the two that matter.
+
+    { "name": "fs_map", "arguments": { "path": "src" } }
+    => "src/hub.py:
+          12: def frobnicate(value):
+        ⋮
+          48: class Dispatcher:
+
+        src/cli.py:
+           7: def main(argv):
+
+        [mapped 2 files (1 skipped: unsupported/binary/too-large), 3 definitions; ranked by references]"
+
+Line numbers are 1-based and pair with `read`'s `offset`, so a definition worth reading is one call away. A `⋮` marks a gap between printed lines, so nothing reads as adjacent that is not.
+
+Ranking is a personalized PageRank over the graph "file A refers to something file B defines". A file is important because the rest of the tree leans on it — not because it is large, and not because it sorts early. Two parameters steer the walk:
+
+  * `query` is space- or comma-separated words. A file whose path or whose defined identifiers contain one of them is weighted ten times, so `query="tokenizer"` re-centres the whole map on the tokenizer's neighbourhood rather than merely grepping for the word.
+
+  * `focus` is space- or comma-separated paths relative to the root, naming files or directories. Each is weighted fifty times: this is "map what is around *this*", for when you already know where you are.
+
+*Which* definitions of a chosen file get printed is a second, separate question, and the answer is not simply "the most referenced". A name's references are shared among the files that define it, and a name that most of the map refers to is set aside altogether. Both rules exist because references are matched by name and nothing else: in a 131-file application, `new` was declared three times and called twelve hundred times, so a naive count made `method new` the one line printed for three unrelated files. Under these rules each of those files is represented by its own class declaration instead, while a symbol that only a handful of files mention — which is what a symbol worth reading looks like — keeps its full weight.
+
+`max-chars` (512 to 65536, default 8192) bounds the answer. The budget is spent **whole files at a time**: when the map does not fit, every file loses its least-referenced definitions first, and whatever still does not fit is dropped as a block rather than cut off mid-file. A half-printed file would invite exactly the mistake the tool exists to prevent — reading a signature that is not really there. The summary line is always last and always present, and says what was left out.
+
+Languages, and how they are read:
+
+  * C, C++, Go, Java, JavaScript, Python, Rust, TypeScript and TSX are parsed with [TreeSitter::Native](https://github.com/m-doughty/TreeSitter-Native), using each grammar's own `tags.scm`. C, C++ and TypeScript get supplemental queries this pack ships, because the vendored ones tag no call references at all (C, C++) or only signature declarations (TypeScript, TSX).
+
+  * Raku — for which no tree-sitter grammar exists — is read by a heuristic scanner: `sub`, `method`, `submethod`, `class`, `role`, `grammar`, `module`, `package`, `token`, `rule`, `regex`, `constant` and `enum` declarations, with comments, Pod blocks and declarator documentation skipped — including the bracketed `#|( … )` and `#=( … )` forms, whose continuation lines carry no `#` and are therefore prose that reads exactly like code. `use Foo::Bar` is an edge to the file that **is** `Foo::Bar`, resolved through a `lib/Foo/Bar.rakumod` index.
+
+  * Everything else is skipped and counted, as are files over 1MB, files that are not text, and unreadable ones.
+
+`.git`, `node_modules`, `target`, `build`, `dist`, `vendor`, `__pycache__`, virtualenvs and every dot-directory are never descended into: a vendored copy of a library outranks the code that uses it, which makes for a confident and useless map. The walk stops after 5000 files and says so.
+
+Parse results are cached per file, keyed on modification time and size, for the lifetime of the toolkit instance — so mapping, editing one file and mapping again re-reads exactly that file. The cache is not bounded and is not written to disk.
+
+`map` is a reading tool: it is registered even when `read-only` is set.
+
 ### stat(path)
 
     { "name": "fs_stat", "arguments": { "path": "notes/todo.md" } }
@@ -371,7 +418,9 @@ Residual risks worth knowing:
 
   * `move` is a rename and only a rename. If the root spans a mount point — a bind mount, a network share grafted into the tree — a move across it fails with the OS's own error instead of silently copying and deleting. Honest, but it means such a move is simply not available; do it with `read` and `write` if you must.
 
-  * Nothing here rate-limits or size-limits: `read` will happily slurp a huge file into memory, `glob` will walk a huge tree, and `grep` reads every text file below the path it is given (`max-results` bounds the *output*, not the reading). Point it at a workspace, not at `/`.
+  * Conditional revisions are authoritative among calls through one toolkit instance. An unrelated process writing the same filesystem does not take this lock, so it can still race between the toolkit's comparison and operating-system mutation. Its completed changes are detected by the next comparison; it does not participate atomically.
+
+  * Nothing here rate-limits or size-limits: `read` will happily slurp a huge file into memory, `glob` will walk a huge tree, and `grep` reads every text file below the path it is given (`max-results` bounds the *output*, not the reading). `map` is the one exception — it prunes, skips files over 1MB, stops after 5000 files and bounds its own output — but its first pass over a large tree still costs a parse of every source file in it. Point the pack at a workspace, not at `/`.
 
 Testing
 -------
@@ -381,7 +430,7 @@ prove6 -Ilib t/           # with MCP::Server installed
 prove6 -Ilib -I../MCP-Server/lib t/    # against a sibling checkout
 ```
 
-`t/03-containment.rakutest` is the file to read first if you change the resolver: it drives every escape attempt through real tool calls, including symlink escapes, and adapts rather than skips on hosts where creating a symlink is not permitted.
+`t/03-containment.rakutest` is the file to read first if you change the resolver: it drives every escape attempt through real tool calls, including symlink escapes, and adapts rather than skips on hosts where creating a symlink is not permitted. `t/05-map.rakutest` is the one to read if you change the map: it builds a small polyglot tree whose ranking has one right answer and asserts that answer, rather than asserting that some map came back.
 
 Examples
 --------

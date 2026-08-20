@@ -64,7 +64,7 @@ subtest 'Legitimate relative paths are accepted' => {
 };
 
 subtest 'Every tool routes through the resolver' => {
-	plan 11;
+	plan 12;
 	errors-with $server, 'fs_read',  { path => '../ok.txt' },
 		"may not contain '..'", 'read';
 	errors-with $server, 'fs_list',  { path => '..' },
@@ -75,6 +75,8 @@ subtest 'Every tool routes through the resolver' => {
 		'must be relative to the configured root', 'stat';
 	errors-with $server, 'fs_grep',  { pattern => 'x', path => '..' },
 		"may not contain '..'", 'grep';
+	errors-with $server, 'fs_map',   { path => '..' },
+		"may not contain '..'", 'map';
 	errors-with $server, 'fs_write', { path => '../escape.txt', content => 'x' },
 		"may not contain '..'", 'write';
 	errors-with $server, 'fs_mkdir', { path => '../boom' },

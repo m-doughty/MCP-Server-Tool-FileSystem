@@ -13,9 +13,10 @@
 #   {"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"work_write","arguments":{"path":"hello.txt","content":"hi there"}}}
 #   {"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"docs_grep","arguments":{"pattern":"symlink","context":1}}}
 #   {"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"work_edit","arguments":{"path":"hello.txt","old-string":"hi","new-string":"hello"}}}
+#   {"jsonrpc":"2.0","id":6,"method":"tools/call","params":{"name":"docs_map","arguments":{"max-chars":2000}}}
 #
 # docs_* is read-only, so docs_edit and docs_delete are not registered at all —
-# tools/list on that prefix shows only read, list, glob, grep and stat.
+# tools/list on that prefix shows only read, list, glob, grep, map and stat.
 
 use MCP::Server;
 
