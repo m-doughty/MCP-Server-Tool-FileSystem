@@ -2,6 +2,13 @@ Revision history for MCP::Server::Tool::FileSystem
 
 {{$NEXT}}
 
+0.2.2  2026-08-21T21:05:33+01:00
+    - Require MCP::Server 0.6.0, the release that actually ships what 0.2.1
+      leans on: tool annotations in the tools/list catalog, the annotated-batch
+      concurrent scheduler, and the bridge's content-only rendering. The old
+      0.4.0+ pin let a resolver hand this pack a server that silently dropped
+      its annotations.
+
 0.2.1  2026-08-21T20:36:03+01:00
     - The six reading tools (read, list, glob, stat, grep, map) now declare the
       MCP annotations readOnlyHint and idempotentHint, so a host may run a

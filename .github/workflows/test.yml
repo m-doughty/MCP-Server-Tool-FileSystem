@@ -1,9 +1,10 @@
 name: test
 
-# NB: the dependency install step pulls MCP::Server from the ecosystem. Until
-# MCP::Server 0.3.0 (the release that ships the toolkit system this pack builds
-# on) is published, that step fails and CI stays red — nothing here needs
-# changing when it lands.
+# NB: the dependency install step pulls MCP::Server from the ecosystem, so CI
+# tests against the RELEASED server, not a sibling checkout. If tests here rely
+# on unreleased MCP::Server work, CI stays red until that release lands — the
+# fix is to release MCP::Server and raise the version pin in META6.json, not
+# to change anything here.
 
 on:
   push:
