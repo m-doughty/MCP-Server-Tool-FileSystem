@@ -114,6 +114,33 @@ touch, and it finds them by name. A tool that called its argument C<filename>
 would sail past a rule written for C<path>. If you write a toolkit of your
 own that is meant to live behind the same guard, use the same names.
 
+=head3 Annotations: which tools may run at once
+
+The six reading tools — C<read>, C<list>, C<glob>, C<stat>, C<grep> and
+C<map> — declare the MCP annotations C<< readOnlyHint => True >> and
+C<< idempotentHint => True >>. The five mutating ones declare nothing.
+
+That is not decoration. A host reads it as a licence to run a batch of those
+calls B<side by side> and to execute identical calls in one batch B<once>
+(C<MCP::Server>'s C<execute-tool-calls> does exactly that), so it is a claim
+about the handlers rather than about the intent — and it holds:
+
+=item The observation tools (C<read>, C<list>, C<stat>) take this instance's
+one mutation lock for the read plus its revision digest, which is the same
+lock the mutators take.
+=item C<map> takes the map cache's own lock around the whole map, so two maps
+of one tree cannot tear the per-file parse cache between them.
+=item C<glob> and C<grep> touch no instance state at all.
+
+Several reads on B<one> pack instance therefore see coherent state. What the
+annotations do B<not> promise is anything about the filesystem underneath: a
+read running beside another process's write is a race the pack never had a
+say in, exactly as it always was.
+
+Ordering is untouched by any of this. A host that batches groups only
+B<neighbouring> calls, so a C<write> between two C<read>s still means read,
+write, read.
+
 =head3 Structured revisions and conditional mutation
 
 C<read>, C<list>, C<stat> and every successful mutator keep their existing text

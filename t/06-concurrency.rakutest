@@ -1,0 +1,198 @@
+use Test;
+use lib 'lib';
+use lib 't/lib';
+use FSTest;
+use MCP::Server;
+use MCP::Server::Tool::FileSystem;
+
+# What the pack promises a host by annotating its reads: the six reading tools
+# say readOnlyHint and idempotentHint, the mutating ones say nothing, and ONE
+# pack instance really does survive a batch of reads running side by side --
+# which is the claim the annotation makes and the reason the caches and the
+# revision map are behind locks.
+
+plan 6;
+
+my $sandbox = make-sandbox('concurrency');
+END nuke($sandbox);
+
+# A tree with enough in it that map has something to rank and grep has plenty
+# to walk: three languages, cross-references, and a file per directory.
+$sandbox.add('src').mkdir;
+$sandbox.add('src/util').mkdir;
+$sandbox.add('src/hub.py').spurt(q:to/PY/);
+	def frobnicate(value):
+	    return value + 1
+
+
+	class Hub:
+	    def dispatch(self, value):
+	        return frobnicate(value)
+	PY
+$sandbox.add('src/edge.py').spurt(q:to/PY/);
+	from hub import Hub
+
+
+	def edge(value):
+	    return Hub().dispatch(value)
+	PY
+$sandbox.add('src/util/tools.rakumod').spurt(q:to/RAKU/);
+	unit module Tools;
+
+	sub frobnicate($value) is export { $value + 1 }
+	sub dispatch($value) is export { frobnicate($value) }
+	RAKU
+$sandbox.add('src/util/notes.md').spurt(
+	"frobnicate is the thing everything calls\n" x 40);
+$sandbox.add('src/main.go').spurt(q:to/GO/);
+	package main
+
+	func Dispatch(value int) int {
+		return value + 1
+	}
+	GO
+
+# ONE toolkit instance behind ONE server, which is the shape that matters: the
+# map cache, the mutation lock and the revision map are per instance, so a test
+# that built a pack per call would prove nothing about any of them.
+my $server = MCP::Server.new(:name<fs-concurrency>, tool-concurrency => 4);
+$server.plug: MCP::Server::Tool::FileSystem.new(:root($sandbox));
+
+my $serial-server = MCP::Server.new(:name<fs-serial>, tool-concurrency => 1);
+$serial-server.plug: MCP::Server::Tool::FileSystem.new(:root($sandbox));
+
+my sub call(Str:D $id, Str:D $name, %arguments) {
+	%( id => $id, function => %( name => $name, arguments => %arguments ) );
+}
+
+subtest 'the reading tools are annotated and the writing ones are not' => {
+	plan 3;
+
+	my %listed = $server.handle-request({
+		jsonrpc => '2.0', id => 1, method => 'tools/list',
+	});
+	my %annotated = %listed<result><tools>
+		.grep({ $_<annotations>:exists })
+		.map({ $_<name> => $_<annotations> })
+		.Hash;
+
+	is-deeply %annotated.keys.sort.List,
+		<fs_glob fs_grep fs_list fs_map fs_read fs_stat>.List,
+		'exactly the six reads carry annotations';
+	is-deeply %annotated.values.map({ $_.Hash }).unique(:with(&[eqv])).List,
+		(%( readOnlyHint => True, idempotentHint => True ),),
+		'and every one of them says the same two things';
+
+	# The mutating tools are the ones a host must never be told it may run
+	# beside anything.
+	my @writers = %listed<result><tools>
+		.grep({ !($_<annotations>:exists) })
+		.map({ $_<name> }).sort;
+	is-deeply @writers.List,
+		<fs_delete fs_edit fs_mkdir fs_move fs_write>.List,
+		'while the five mutating tools declare nothing at all';
+};
+
+subtest 'a read batch through the bridge answers as a serial one does' => {
+	plan 2;
+
+	my @calls = (
+		call('a', 'fs_read', %( path => 'src/hub.py' )),
+		call('b', 'fs_grep', %( pattern => 'frobnicate', path => 'src' )),
+		call('c', 'fs_map',  %( path => 'src' )),
+		call('d', 'fs_list', %( path => 'src' )),
+		call('e', 'fs_glob', %( pattern => '*.py', path => 'src' )),
+		call('f', 'fs_stat', %( path => 'src/main.go' )),
+	);
+
+	my @wide = $server.execute-tool-calls(@calls);
+	my @serial = $serial-server.execute-tool-calls(@calls);
+
+	is @wide.map({ $_<tool_call_id> }).List, <a b c d e f>.List,
+		'every slot answered, in model order';
+	is-deeply @wide.map({ $_<content> }).List,
+		@serial.map({ $_<content> }).List,
+		'and every answer is the answer a one-at-a-time batch gives';
+};
+
+subtest 'fs_map and fs_grep interleaved, on one pack, over and over' => {
+	plan 3;
+
+	# The stress the map cache was written against: several maps of one tree
+	# racing each other while greps walk the same files. The cache is keyed by
+	# path and validated by mtime+size, so a second map is nearly free -- and
+	# a cache without a lock around it is a corrupted map or a crash.
+	# Built with a loop rather than a flattening map: `flat` over a list of
+	# Hashes flattens the HASHES into pairs, which is a batch of nonsense the
+	# bridge dutifully answers with "unknown tool".
+	my @calls;
+	for ^4 -> $i {
+		@calls.push: call("m$i", 'fs_map',  %( path => 'src', query => "frobnicate$i" ));
+		@calls.push: call("g$i", 'fs_grep', %( pattern => 'dispatch', path => 'src',
+			'max-results' => 10 + $i ));
+		@calls.push: call("r$i", 'fs_read', %( path => 'src/edge.py' ));
+	}
+
+	my @rounds = (^4).map({ $server.execute-tool-calls(@calls) }).List;
+
+	is-deeply @rounds.map({ $_.elems }).unique.List, (@calls.elems,),
+		'every round answered every call';
+	my @failures = @rounds.map({ $_.list }).flat.grep({ $_<is_error> });
+	is @failures.elems, 0,
+		'and not one of the twelve answers per round failed';
+
+	# Round one warms the map cache; every round after it reads the cache from
+	# four threads at once. Identical answers are the proof it stayed coherent.
+	is-deeply @rounds[3].map({ $_<content> }).List,
+		@rounds[1].map({ $_<content> }).List,
+		'a warm cache read concurrently gives the same maps as a cold one';
+};
+
+subtest 'identical reads in one batch are one read' => {
+	plan 2;
+
+	# fs_read goes through the mutation lock and computes a revision digest, so
+	# a duplicate is a file read plus a hash saved -- and the point of a
+	# fan-out is that the model still gets both answers.
+	my @results = $server.execute-tool-calls((
+		call('a', 'fs_read', %( path => 'src/hub.py' )),
+		call('b', 'fs_read', %( path => 'src/hub.py' )),
+	));
+
+	is @results.map({ $_<tool_call_id> }).List, ('a', 'b'), 'both slots answered';
+	is @results[0]<content>, @results[1]<content>,
+		'with the same file, which is what "idempotent" claimed';
+};
+
+subtest 'a write in the batch puts the reads back in the queue' => {
+	plan 3;
+
+	# The ordering guarantee the annotations must not cost: a read after a
+	# write in one batch sees what the write did.
+	my @results = $server.execute-tool-calls((
+		call('a', 'fs_read',  %( path => 'src/hub.py' )),
+		call('b', 'fs_write', %( path => 'src/new.txt', content => 'written' )),
+		call('c', 'fs_read',  %( path => 'src/new.txt' )),
+	));
+
+	is @results.map({ $_<tool_call_id> }).List, <a b c>.List, 'three answers, in order';
+	nok @results.grep({ $_<is_error> }).elems, 'none of them an error';
+	is @results[2]<content>, 'written',
+		'and the read after the write sees what the write wrote';
+};
+
+subtest 'a read-only pack still annotates what it publishes' => {
+	plan 2;
+
+	my $ro = MCP::Server.new(:name<fs-read-only>);
+	$ro.plug: MCP::Server::Tool::FileSystem.new(:root($sandbox), :read-only);
+
+	my %listed = $ro.handle-request({
+		jsonrpc => '2.0', id => 1, method => 'tools/list',
+	});
+	my @names = %listed<result><tools>.map({ $_<name> }).sort;
+	is-deeply @names.List, <fs_glob fs_grep fs_list fs_map fs_read fs_stat>.List,
+		'a read-only pack publishes the six reads and nothing else';
+	is %listed<result><tools>.grep({ $_<annotations>:exists }).elems, 6,
+		'every one of them annotated, so a host may batch the lot';
+};

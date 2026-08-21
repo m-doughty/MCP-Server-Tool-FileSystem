@@ -32,6 +32,27 @@ has Lock $!map-lock .= new;
 my constant REVISION-SCHEME = 'sha256-v1';
 my constant EXPECTED-REVISIONS = '_expected-revisions';
 
+#| The MCP annotations every reading tool in this pack carries: it changes
+#| nothing under the root, and calling it again with the same arguments adds
+#| nothing to what the first call did.  A host may act on that — C<MCP::Server>
+#| runs a batch of them side by side, and de-duplicates identical calls within
+#| it — so the claim has to be true of the B<handler>, not merely of the
+#| intent: every read path below is either pure, or takes this instance's own
+#| lock (the mutation lock for the observation tools, the map lock for the map
+#| cache), which is what makes two of them at once safe.
+#|
+#| The mutating tools deliberately carry none.  A write is not read-only and a
+#| C<move> is not idempotent, and a pack that annotated them "for completeness"
+#| would be handing a host permission it must not have.
+#|
+#| A C<Map> rather than a Hash literal: `constant %h = {...}` freezes the
+#| container and not the object inside it, so the "constant" could still be
+#| mutated in place by whoever it is handed to.
+my constant READ-ANNOTATIONS = Map.new((
+	readOnlyHint   => True,
+	idempotentHint => True,
+));
+
 submethod TWEAK {
 	die "FileSystem root does not exist or is not a directory: {$!root}"
 		unless $!root.d;
@@ -53,6 +74,7 @@ method default-prefix(--> Str) { 'fs' }
 # 'filename' for a seventh tool — silently widens what it waves through.
 method register($registrar) {
 	$registrar.tool: 'read',
+		annotations => READ-ANNOTATIONS,
 		description => 'Read a UTF-8 text file from inside the server root. '
 			~ 'Paths are relative to that root; absolute paths and ".." are refused. '
 			~ 'Give offset and/or limit to read a window of lines instead of the '
@@ -88,6 +110,7 @@ method register($registrar) {
 		};
 
 	$registrar.tool: 'list',
+		annotations => READ-ANNOTATIONS,
 		description => 'List the immediate contents of a directory inside the '
 			~ 'server root, one entry per line, sorted, directories marked with a '
 			~ 'trailing "/".',
@@ -103,6 +126,7 @@ method register($registrar) {
 		};
 
 	$registrar.tool: 'glob',
+		annotations => READ-ANNOTATIONS,
 		description => 'Find files anywhere below a directory by wildcard. '
 			~ '"*" matches any run of characters within one path segment, "?" '
 			~ 'matches a single character; matching is case-sensitive and regexes '
@@ -125,6 +149,7 @@ method register($registrar) {
 		};
 
 	$registrar.tool: 'stat',
+		annotations => READ-ANNOTATIONS,
 		description => 'Report the type, size, modification time and access '
 			~ 'flags of a path inside the server root.',
 		params => {
@@ -140,6 +165,7 @@ method register($registrar) {
 		};
 
 	$registrar.tool: 'grep',
+		annotations => READ-ANNOTATIONS,
 		description => 'Search the files below a directory inside the server root '
 			~ 'for lines containing a pattern, reported as "path:line:text". The '
 			~ 'pattern is literal text unless regex is set, in which case it is a '
@@ -187,6 +213,7 @@ method register($registrar) {
 		};
 
 	$registrar.tool: 'map',
+		annotations => READ-ANNOTATIONS,
 		description => 'Map the shape of the code below a directory before '
 			~ 'reading files: the highest-ranked files as skeletons — path plus '
 			~ 'the definition lines of their most-referenced symbols, never '

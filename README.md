@@ -107,6 +107,22 @@ Parameter names in this pack are a contract, not a matter of taste:
 
 The reason is what sits in front of the server. A permission layer — Claude Code's directory rules, or [MCP::Client::Policy](https://github.com/m-doughty/MCP-Client) — decides whether a call may go through by looking at which files it would touch, and it finds them by name. A tool that called its argument `filename` would sail past a rule written for `path`. If you write a toolkit of your own that is meant to live behind the same guard, use the same names.
 
+### Annotations: which tools may run at once
+
+The six reading tools — `read`, `list`, `glob`, `stat`, `grep` and `map` — declare the MCP annotations `readOnlyHint => True ` and `idempotentHint => True `. The five mutating ones declare nothing.
+
+That is not decoration. A host reads it as a licence to run a batch of those calls **side by side** and to execute identical calls in one batch **once** (`MCP::Server`'s `execute-tool-calls` does exactly that), so it is a claim about the handlers rather than about the intent — and it holds:
+
+  * The observation tools (`read`, `list`, `stat`) take this instance's one mutation lock for the read plus its revision digest, which is the same lock the mutators take.
+
+  * `map` takes the map cache's own lock around the whole map, so two maps of one tree cannot tear the per-file parse cache between them.
+
+  * `glob` and `grep` touch no instance state at all.
+
+Several reads on **one** pack instance therefore see coherent state. What the annotations do **not** promise is anything about the filesystem underneath: a read running beside another process's write is a race the pack never had a say in, exactly as it always was.
+
+Ordering is untouched by any of this. A host that batches groups only **neighbouring** calls, so a `write` between two `read`s still means read, write, read.
+
 ### Structured revisions and conditional mutation
 
 `read`, `list`, `stat` and every successful mutator keep their existing text content and additionally return `structuredContent` with `revisionScheme = sha256-v1`. Each location is `absent`, `file`, `directory`, or `symlink` with an opaque token. File tokens hash exact bytes; directory tokens hash a canonical, path-sorted recursive tree description, so a descendant change changes the directory revision.

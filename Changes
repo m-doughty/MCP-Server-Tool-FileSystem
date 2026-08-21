@@ -2,6 +2,15 @@ Revision history for MCP::Server::Tool::FileSystem
 
 {{$NEXT}}
 
+0.2.1  2026-08-21T20:36:03+01:00
+    - The six reading tools (read, list, glob, stat, grep, map) now declare the
+      MCP annotations readOnlyHint and idempotentHint, so a host may run a
+      batch of them side by side and execute identical calls once. The claim
+      is about the handlers as much as the intent: the observation tools take
+      this instance's mutation lock and the map cache is behind its own, so
+      several reads on ONE pack instance see coherent state. The five mutating
+      tools deliberately declare nothing.
+
 0.2.0  2026-08-20T22:49:48+01:00
     - New reading tool: map(path, query, focus, max-chars). Returns a ranked
       skeleton of the code below a directory — each file as its path plus the
