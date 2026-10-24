@@ -247,8 +247,20 @@ subtest 'Symlink chains, relative targets and cycles' => {
 # j::$INDEX_ALLOCATION form reaches through a junction j), a trailing dot or
 # space (dropped) and an 8.3 short name (opened as whichever long name it was
 # given) all open some other name, and are refused. The rule is pure string
-# work, so it is pinned on every host, and the resolver's use of it with a
-# faked $*DISTRO.
+# work, so it is pinned on every host.
+#
+# What a stand-in $*DISTRO can and cannot make of a host. It decides which
+# rules the resolver applies -- whether a segment is checked for these names,
+# whether '\' separates, whether a drive letter is a volume -- and nothing
+# else: the paths themselves still come from IO::Path, spelled the way the
+# host's own $*SPEC spells them. A Windows stand-in on POSIX is therefore a
+# faithful Windows, because the Windows rules read '/'-spelled paths as well
+# as '\'-spelled ones; it runs on every host. A POSIX stand-in on Windows is
+# not a POSIX host at all: the root comes back as D:\a\...\root, the POSIX
+# rules split it on '/' alone, and the resolver -- correctly, for the paths it
+# was handed -- cannot see the file inside the root it is. So the POSIX half
+# is asserted with the host's own $*DISTRO and no stand-in: on POSIX, that
+# these names are ordinary; on Windows, that the real platform refuses them.
 subtest 'On Windows, a segment Windows would read as another name is refused' => {
 	my &hazard = &MCP::Server::Tool::FileSystem::windows-segment-hazard;
 	my @refused = 'j::$INDEX_ALLOCATION', 'x:stream', 'secret.', 'secret ', '...', '. .',
@@ -277,10 +289,15 @@ subtest 'On Windows, a segment Windows would read as another name is refused' =>
 			'an ordinary path is still served';
 	}
 
-	{
+	# With the host's own $*DISTRO, no stand-in.
+	if $*DISTRO.is-win {
+		errors-with $server, 'fs_read', { path => 'missing.' }, 'dot or a space',
+			'on this Windows host, with its own $*DISTRO, a trailing dot is refused';
+		errors-with $server, 'fs_read', { path => 'MISSIN~1' }, '8.3 short name',
+			'and so is an 8.3 short name';
+	} else {
 		# On POSIX every one of those is an ordinary name: a read of one that
 		# does not exist is "not found", never refused.
-		my $*DISTRO = class { method is-win(--> Bool) { False } }.new;
 		errors-with $server, 'fs_read', { path => 'missing.' }, 'not found',
 			'a trailing dot is a name on POSIX';
 		errors-with $server, 'fs_read', { path => 'MISSIN~1' }, 'not found',
