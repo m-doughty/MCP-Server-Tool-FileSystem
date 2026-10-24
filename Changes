@@ -2,6 +2,43 @@ Revision history for MCP::Server::Tool::FileSystem
 
 {{$NEXT}}
 
+0.2.5  2026-10-24T20:03:29+01:00
+    - BUGFIX: [2026-10-24] Windows installs of 0.2.4 failed at the test
+      step, in t/11-handles.rakutest, with no leak to find. Windows'
+      GetProcessHandleCount counts every handle the process owns -- threads,
+      events, the I/O completion port, handles waiting on a finaliser -- and
+      on GitHub's Windows runners it wandered by about 20 in either
+      direction over a batch whatever the batch's size (-11 then +20 over
+      130 tool calls, +23 then +20 over 40 searches), past the fixed
+      allowance of 10 the test held each batch to. The test now asks for a
+      garbage collection before every count, and fails a batch only when it
+      moves the count by more than one handle per tool call or search (one
+      per four reads of `$*DISTRO`), and never by less than 10, with batches
+      of 130 calls, 80 searches and 400 reads: limits of 130, 80 and 100,
+      four to six times the noise Windows showed, and at most a quarter of
+      the smallest leak the test exists for, which kept 1 descriptor per
+      read and 5 to 29 per call. Against the lib with that leak it still
+      fails every count, by 401, 1701 and 1215.
+    - MAINT: [2026-10-24] the containment walk always ends, and a test says
+      so. The walk climbs a path's parents until it meets the root or the
+      top of the filesystem, and a path that is not absolute has no top: the
+      parent of `..` is `../..`, for ever. No path a client sends can make
+      one -- every path the resolver builds is absolute, on every platform,
+      and a sweep of hostile spellings (backslashes, drive, UNC and device
+      prefixes, mixed separators, trailing dots and spaces, runs of
+      thousands of separators) through every tool, under both platforms'
+      rules, found nothing that hung -- but a Windows stand-in for
+      `$*DISTRO` on POSIX, the way tests exercise Windows code, read a link
+      to `C:\x` as a path on drive C: and climbed the resulting relative path
+      until killed. The walk now refuses a path that is not absolute, and
+      stops after as many steps as the path has characters whatever a
+      platform's parents do, so it ends on any input; the stand-in's read is
+      refused as escaping the root. (The fix itself went out in 0.2.4; this
+      entry and its test follow it.) New t/03 subtest runs the hostile
+      spellings through the tools, and the stand-in's read, each under a
+      deadline, on a pack of its own so a walk that never ended could not
+      wedge the rest of the file.
+
 0.2.4  2026-10-24T19:29:01+01:00
     - HOTFIX: [2026-10-24] Windows filesystem testing checks for errors on
       POSIX reqs.

@@ -4,7 +4,7 @@ use MCP::Server::Tool::FileSystem::Test::Kit;
 use MCP::Server;
 use MCP::Server::Tool::FileSystem;
 
-plan 10;
+plan 11;
 
 my $sandbox = make-sandbox('containment');
 my $outside = make-sandbox('outside');
@@ -22,6 +22,15 @@ $outside.add('vault').add('key.txt').spurt('KEY');
 
 my $server = MCP::Server.new(:name<confined>);
 $server.plug: MCP::Server::Tool::FileSystem.new(:root($sandbox));
+
+#| Run &code on a thread of its own and give it $seconds: the Promise comes
+#| back kept only if the code finished in time. A walk that never ended would
+#| otherwise take the whole file with it.
+sub in-time(&code, Real:D $seconds = 10 --> Promise:D) {
+	my $work = start { code() };
+	await Promise.anyof($work, Promise.in($seconds));
+	$work;
+}
 
 subtest 'Paths that could leave the root are refused' => {
 	my @cases =
@@ -302,6 +311,74 @@ subtest 'On Windows, a segment Windows would read as another name is refused' =>
 			'a trailing dot is a name on POSIX';
 		errors-with $server, 'fs_read', { path => 'MISSIN~1' }, 'not found',
 			'and so is a tilde';
+	}
+};
+
+# Every walk up a path's parents has to end, because a client controls the
+# path strings and a walk that does not end is a server that has stopped
+# answering. Each call below runs on a thread of its own under a deadline, so
+# a walk that never ends fails its assertion instead of taking the file with
+# it.
+#
+# What is real and what is emulated. The spellings are real input, sent
+# through the real tools with the host's own rules: backslashes, drive and
+# UNC prefixes, device paths, mixed separators, trailing dots and spaces, runs
+# of thousands of separators. None of them hung on any build of this pack;
+# they are here so none ever does. The walk that DID never end needs a path
+# that is not absolute, whose parents go on for ever (the parent of '..' is
+# '../..'), and only one platform's rules applied to another's spelling make
+# one: a Windows stand-in for $*DISTRO on POSIX, meeting a link to C:\x, read
+# that as a path on drive C: and handed the walk the relative POSIX path
+# 'C:/x'. That is emulated, so it runs on POSIX, the only place it can arise;
+# the walk's own refusal of a relative path is pinned on every host.
+subtest 'No spelling of a path makes a containment walk go on for ever' => {
+	my Bool:D $posix = !$*DISTRO.is-win;
+	# Q[...] throughout, so that every backslash is one backslash.
+	my @spellings =
+		Q[a\b], Q[dir\inner.txt], Q[C:\x\y], 'C:/x', 'C:x', 'C:', 'Z:/dir',
+		Q[\\server\share\x], '//server/share/x', Q[\\?\C:\x], Q[\\.\pipe\x], '//?/C:/x', '//./pipe/x',
+		Q[\], Q[\\], Q[\\?\], '//', Q[a/b\c/d], Q[dir\.\inner.txt], Q[dir\..\ok.txt], Q[..\x],
+		'x.', 'x ', 'x. ', 'dir. ', Q[dir\inner.txt.], '. .',
+		'dir' ~ (Q[\] x 5000) ~ 'inner.txt', 'a' ~ (Q[\] x 10000), Q[a\] x 3000,
+		'dir' ~ ('/' x 5000) ~ 'inner.txt', 'x' x 5000, Q[dir\CON\x], 'x:stream', 'MISSIN~1';
+	my @tools = <fs_stat fs_read fs_grep>;
+	plan 3 + $posix;
+
+	# A pack of its own: a read holds its instance's lock, and a walk that
+	# never ended would hold it for good, wedging every later subtest's call
+	# instead of failing only this one.
+	my $hostile = MCP::Server.new(:name<hostile>);
+	$hostile.plug: MCP::Server::Tool::FileSystem.new(:root($sandbox));
+
+	my &contains = &MCP::Server::Tool::FileSystem::path-contains;
+	my $relative = in-time({ contains($sandbox, 'a/b'.IO) });
+	ok $relative.status ~~ Kept && !$relative.result,
+		'A relative path is not inside the root, and the walk says so at once';
+	my $dot-dot = in-time({ contains($sandbox, '..'.IO) });
+	ok $dot-dot.status ~~ Kept && !$dot-dot.result, "and so is '..', whose parents never end";
+
+	my @late;
+	for @spellings X @tools -> ($spelling, $tool) {
+		my %args = $tool eq 'fs_grep'
+			?? %( pattern => 'inner', path => $spelling )
+			!! %( path => $spelling );
+		my $call = in-time({ call-tool($hostile, $tool, %args) });
+		@late.push: "$tool {$spelling.raku.substr(0, 40)}" unless $call.status ~~ Kept;
+	}
+	ok !@late, "Every one of {@spellings * @tools} calls with a hostile spelling answered in time";
+	diag "no answer in time: $_" for @late;
+
+	if $posix {
+		my $link = $sandbox.add('drive-link');
+		run('ln', '-s', 'C:\x\y', $link.absolute, :out, :err).out.slurp(:close);
+		LEAVE { $link.unlink if $link.l }
+		my class WindowsStandIn { method is-win(--> Bool) { True } }
+		my $read = do {
+			my $*DISTRO = WindowsStandIn.new;
+			in-time({ result-text(call-tool($hostile, 'fs_read', { path => 'drive-link' })) });
+		};
+		ok $read.status ~~ Kept && $read.result.contains('escapes the configured root'),
+			'A Windows stand-in meeting a link to C:\x\y refuses it rather than climbing for ever';
 	}
 };
 
