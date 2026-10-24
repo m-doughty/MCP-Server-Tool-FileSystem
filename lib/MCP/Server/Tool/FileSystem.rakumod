@@ -91,11 +91,9 @@ my constant READ-ANNOTATIONS = Map.new((
 submethod TWEAK {
 	die "FileSystem root does not exist or is not a directory: {$!root}"
 		unless $!root.d;
-	# Resolve once, up front: every containment check compares against this, so
-	# it must already be free of symlinks and relative segments.  resolve alone
-	# is not enough — it does not follow symlinks on Windows — so the same
-	# link chase the resolver uses runs on the root too.
-	$!root .= resolve;
+	# Chase the original spelling: IO::Path.resolve can mis-join a Windows
+	# junction's absolute target onto its parent before we ever see it.
+	# physical-path handles relative paths and dot segments itself.
 	$!root = physical-path($!root);
 }
 
@@ -1089,6 +1087,7 @@ our sub physical-path(IO::Path:D $path, Int:D :$max-hops = 40 --> IO::Path:D) {
 	@todo = collapse-dots(@todo, $path.absolute) if $*DISTRO.is-win;
 	my Str @out;
 	my Int $hops = 0;
+	my Int $missing-depth = 0;
 
 	while @todo {
 		my Str $part = @todo.shift.Str;
@@ -1099,12 +1098,22 @@ our sub physical-path(IO::Path:D $path, Int:D :$max-hops = 40 --> IO::Path:D) {
 			# is what the kernel itself does — this is what makes a link to
 			# 'a/../b' land where the OS would land it.
 			@out.pop if @out;
+			$missing-depth = 0 if @out.elems < $missing-depth;
 			next;
 		}
 
+		# Nothing below a missing/non-directory prefix can be a link. Avoid
+		# constructing and stat-ing thousands of increasingly long paths.
+		# On POSIX '..' above can climb back into the existing tree, at which
+		# point the link checks resume. Windows collapsed its dots already.
+		if $missing-depth {
+			@out.push: $part;
+			next;
+		}
 		my IO::Path $cur = join-parts($volume, (|@out, $part));
 		unless $cur.l {
 			@out.push: $part;
+			$missing-depth = @out.elems unless $cur.d;
 			next;
 		}
 
@@ -1217,26 +1226,22 @@ my sub join-parts(Str:D $volume, @parts --> IO::Path:D) {
 	($volume ~ '/' ~ @parts.join('/')).IO;
 }
 
-#| Internal: True when $path is $root itself or lives underneath it.  Walks the
-#| parent chain rather than comparing string prefixes, so /srv/root2 is never
-#| mistaken for a child of /srv/root; separator spelling is unified on Windows
-#| before comparing, where either slash may appear.  Comparison is exact-case:
-#| on a case-insensitive filesystem a case-mismatched root can only deny
-#| access, never grant it.  Total: it returns for any pair of paths (see
-#| climb-limit).  Exposed with `our` scope for the containment tests — not
-#| part of the public API.
+#| Internal: True when $path is $root itself or lives underneath it. Compare
+#| volumes and complete components, so /srv/root2 is never inside /srv/root.
+#| Callers must chase links and dot segments with physical-path first. Names
+#| are compared in exact case; Windows drive letters and separators are
+#| normalised by split-absolute. Splitting once avoids the quadratic cost of
+#| constructing every parent of a deep path. Relative candidates are refused.
+#| Exposed with `our` scope for tests — not part of the public API.
 our sub path-contains(IO::Path:D $root, IO::Path:D $path --> Bool:D) {
-	my Int $steps = climb-limit($path);
-	return False without $steps;
-	my Str $root-key = path-key($root);
-	my $p = $path;
-	for ^$steps {
-		return True if path-key($p) eq $root-key;
-		my $up = $p.parent;
-		last if $up.absolute eq $p.absolute;   # reached the filesystem root
-		$p = $up;
+	return False unless $path.is-absolute;
+	my ($root-volume, @root-parts) = split-absolute($root.absolute);
+	my ($volume, @parts) = split-absolute($path.absolute);
+	return False unless $volume eq $root-volume && @parts.elems >= @root-parts.elems;
+	for @root-parts.kv -> $i, $part {
+		return False unless @parts[$i] eq $part;
 	}
-	False;
+	True;
 }
 
 # How many steps a walk up $path's parents may take: undefined for a path
@@ -1246,8 +1251,8 @@ our sub path-contains(IO::Path:D $root, IO::Path:D $path --> Bool:D) {
 # step that does not stop the walk removes at least one character.  Every
 # path the resolver builds is absolute; a relative one can only be made by
 # applying one platform's rules to another's spelling (a Windows stand-in for
-# $*DISTRO on POSIX meeting a link to 'C:\x'), and the walks refuse it rather
-# than climb for ever.
+# $*DISTRO on POSIX meeting a link to 'C:\x'), and relative-parts refuses it
+# rather than climb for ever.
 my sub climb-limit(IO::Path:D $path --> Int) {
 	$path.is-absolute ?? $path.absolute.chars + 1 !! Int;
 }
@@ -1259,8 +1264,6 @@ my sub path-key(IO::Path:D $p --> Str:D) {
 	$*DISTRO.is-win ?? $p.absolute.subst('\\', '/', :g) !! $p.absolute;
 }
 
-#| Path segments of $path relative to $root.  Callers join with '/' so tool
-#| output reads the same on every platform.
 # When the file was last written. Not IO::Path.modified: on 64-bit Windows
 # MoarVM wraps its nanosecond timestamp at 32 bits, so every file lands
 # within about two seconds of 1970, and elsewhere it is 37 seconds early
@@ -1271,6 +1274,8 @@ my sub file-mtime(IO::Path:D $path --> Instant:D) {
 		nqp::const::STAT_MODIFYTIME))
 }
 
+#| Path segments of $path relative to $root.  Callers join with '/' so tool
+#| output reads the same on every platform.
 my sub relative-parts(IO::Path:D $root, IO::Path:D $path --> List) {
 	my Int $steps = climb-limit($path);
 	die "Cannot place '$path' under the root: it is not an absolute path" without $steps;

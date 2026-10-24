@@ -523,11 +523,11 @@ Confinement is the whole point of this pack, so it is done in layers that each h
 
   * **Physical-path symlink chase.** The candidate path is built segment by segment under the root; then every symlink in it is chased to its destination — component by component, the way `realpath` works, with a hop budget against cycles — and the *physical* result is checked against the root. A symlink planted inside the sandbox therefore cannot be used as a door out of it, whether it points at a file or a directory, whether directly or through a chain, and whether its target is absolute or relative. The chase is the pack's own (over `readlink`), **not** `IO::Path.resolve`, because `.resolve` does not follow symlinks on Windows — an unfollowed link is an open door the OS walks through at open time even though a check did not. One code path runs on every platform, and it resolves `..` the way *this* platform's OS does: physically on POSIX, by name on Windows (see [Resolving a path the way the OS will](#Resolving a path the way the OS will)). A link whose target cannot be read, a chain that exceeds the hop budget, a Windows drive-relative (`C:foo`) or device-path (`\\?\…`) target, and a Windows segment of dots and spaces other than `.` and `..` are all refused outright: fail closed.
 
-  * **Parent-chain containment, not string prefixes.** The final check walks `.parent` from the chased path up to the filesystem root looking for the root itself. `/srv/root2` is not inside `/srv/root`, and no separator-spelling difference can fake a match — on Windows both slash spellings are unified before comparing.
+  * **Component containment.** The final check compares the volume and complete path components of the chased path against the root. `/srv/root2` is not inside `/srv/root`. On Windows both slash spellings and drive-letter case are unified before comparing; different drives and UNC shares remain distinct. Each path is split once, so a deeply nested path does not require constructing every parent directory.
 
 The textual rejections are deliberately redundant with the physical check: two independent layers fail independently, and they make the failure message say what the model did wrong.
 
-Comparison is exact-case. On a case-insensitive filesystem, a root configured with different casing than the path the OS reports can only produce a *false negative* — access denied — never a false positive. It fails closed.
+Path-component comparison is exact-case. On a case-insensitive filesystem, a root configured with different casing than the path the OS reports can only produce a *false negative* — access denied — never a false positive. It fails closed.
 
 ### Byte fidelity, and why CRLF is a security property
 

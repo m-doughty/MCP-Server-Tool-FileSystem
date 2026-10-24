@@ -125,8 +125,8 @@ subtest 'Refused writes leave nothing behind' => {
 	ok $sandbox.add('ok.txt').e, 'And the file the move named is still where it was';
 };
 
-subtest 'path-contains walks the parent chain' => {
-	plan 6;
+subtest 'path-contains compares complete path components' => {
+	plan 15;
 	my &contains = &MCP::Server::Tool::FileSystem::path-contains;
 	ok contains($sandbox, $sandbox), 'The root contains itself';
 	ok contains($sandbox, $sandbox.add('dir').add('inner.txt')), 'A descendant is contained';
@@ -137,6 +137,21 @@ subtest 'path-contains walks the parent chain' => {
 	my $sibling = $sandbox.parent.add($sandbox.basename ~ '2');
 	nok contains($sandbox, $sibling), 'A sibling sharing the root as a string prefix is not contained';
 	ok contains($sibling, $sibling.add('child')), 'That sibling contains its own children';
+	ok contains($sandbox, $sandbox.add('child/' x 3000)), 'A deep descendant is contained';
+	nok contains($sandbox, $sibling.add('child/' x 3000)), 'A deep sibling descendant is outside';
+	# Windows volumes and spellings, checked on every host: Win32 paths under
+	# a Windows stand-in for $*DISTRO, which is all path-contains consults.
+	{
+		my $*DISTRO = class { method is-win(--> Bool) { True } }.new;
+		my sub win(Str:D $p --> IO::Path:D) { IO::Path.new($p, :SPEC(IO::Spec::Win32)) }
+		nok contains(win('C:/root'), win('D:/root/child')), 'Different drive volumes are distinct';
+		ok contains(win('C:/root'), win('c:/root/child')), 'Drive letter case does not change the volume';
+		ok contains(win('C:/root'), win(Q[C:\root\child])), 'A backslash and a slash are the same separator';
+		nok contains(win('C:/root'), win('C:/Root/child')), 'Other components compare in exact case';
+		nok contains(win('C:/root'), win('C:root/child')), 'A drive-relative path is not inside';
+		ok contains(win('//server/share/root'), win('//server/share/root/child')), 'A UNC descendant is contained';
+		nok contains(win('//server/share'), win('//server/share2/child')), 'A different UNC share is outside';
+	}
 };
 
 subtest 'Symlinks pointing out of the root are refused' => {
@@ -323,14 +338,15 @@ subtest 'On Windows, a segment Windows would read as another name is refused' =>
 # What is real and what is emulated. The spellings are real input, sent
 # through the real tools with the host's own rules: backslashes, drive and
 # UNC prefixes, device paths, mixed separators, trailing dots and spaces, runs
-# of thousands of separators. None of them hung on any build of this pack;
-# they are here so none ever does. The walk that DID never end needs a path
+# of thousands of separators. Rebuilding every parent of the 3,000-component
+# path took over a minute on Windows before component comparison replaced
+# that walk. The older walk that never ended at all needed a path
 # that is not absolute, whose parents go on for ever (the parent of '..' is
 # '../..'), and only one platform's rules applied to another's spelling make
 # one: a Windows stand-in for $*DISTRO on POSIX, meeting a link to C:\x, read
 # that as a path on drive C: and handed the walk the relative POSIX path
 # 'C:/x'. That is emulated, so it runs on POSIX, the only place it can arise;
-# the walk's own refusal of a relative path is pinned on every host.
+# path-contains' own refusal of a relative path is pinned on every host.
 subtest 'No spelling of a path makes a containment walk go on for ever' => {
 	my Bool:D $posix = !$*DISTRO.is-win;
 	# Q[...] throughout, so that every backslash is one backslash.
@@ -353,7 +369,7 @@ subtest 'No spelling of a path makes a containment walk go on for ever' => {
 	my &contains = &MCP::Server::Tool::FileSystem::path-contains;
 	my $relative = in-time({ contains($sandbox, 'a/b'.IO) });
 	ok $relative.status ~~ Kept && !$relative.result,
-		'A relative path is not inside the root, and the walk says so at once';
+		'A relative path is not inside the root, and path-contains says so at once';
 	my $dot-dot = in-time({ contains($sandbox, '..'.IO) });
 	ok $dot-dot.status ~~ Kept && !$dot-dot.result, "and so is '..', whose parents never end";
 
@@ -363,7 +379,12 @@ subtest 'No spelling of a path makes a containment walk go on for ever' => {
 			?? %( pattern => 'inner', path => $spelling )
 			!! %( path => $spelling );
 		my $call = in-time({ call-tool($hostile, $tool, %args) });
-		@late.push: "$tool {$spelling.raku.substr(0, 40)}" unless $call.status ~~ Kept;
+		unless $call.status ~~ Kept {
+			@late.push: "$tool {$spelling.raku.substr(0, 40)}";
+			# A deadline does not cancel the worker or release its lock.
+			# Do not queue the rest of the test behind a call that timed out.
+			last;
+		}
 	}
 	ok !@late, "Every one of {@spellings * @tools} calls with a hostile spelling answered in time";
 	diag "no answer in time: $_" for @late;

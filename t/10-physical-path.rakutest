@@ -16,7 +16,7 @@ use MCP::Server::Tool::FileSystem::Test::Kit;
 # Mode or an elevated shell create; the rule it exercises is also pinned as
 # pure string work in the last subtest, which runs everywhere.
 
-plan 8;
+plan 10;
 
 my &physical = &MCP::Server::Tool::FileSystem::physical-path;
 my &reparse  = &MCP::Server::Tool::FileSystem::windows-reparse;
@@ -57,7 +57,7 @@ sub native(IO::Path:D $p --> Str:D) {
 	$*DISTRO.is-win ?? $abs.subst(/^ (<[a..z]>) ':'/, { $0.uc ~ ':' }) !! $abs;
 }
 
-my $real = $base.add('real');
+my $real = $base.add('real target');
 $real.mkdir;
 $real.add('f.txt').spurt('in real');
 
@@ -92,6 +92,33 @@ subtest 'a chain of links is followed to its end' => {
 	is physical($j2.add('missing').add('deeper')).absolute,
 		native($real.add('missing').add('deeper')),
 		'and a tail that does not exist is kept, under the real directory';
+};
+
+subtest 'a directory link can be the configured root' => {
+	plan 4;
+	my $pack = MCP::Server::Tool::FileSystem.new(:root($base.add('j')));
+	is $pack.root.absolute, native($real), 'the root is the actual junction or symlink target';
+	my $server = MCP::Server.new(:name<link-root>);
+	$server.plug: $pack;
+	my %read = call-tool($server, 'fs_read', { path => 'f.txt' });
+	nok result-errored(%read), 'a file under the linked root can be read';
+	is result-text(%read), 'in real', 'the target file is returned';
+	# Containment is held to the link's target, not to the directory the
+	# link sits in: a link inside the target leading back out to $base is
+	# an escape, however the root was spelled.
+	$base.add('outside.txt').spurt('outside');
+	dir-link($base, $real.add('out'));
+	errors-with $server, 'fs_read', { path => 'out/outside.txt' },
+		'escapes the configured root', 'the linked root still enforces containment';
+};
+
+subtest 'a missing suffix does not hide a later link after dot-dot' => {
+	plan 2;
+	my $path = $base.add('missing').add('child').add('..').add('..').add('j').add('f.txt');
+	is physical($path).absolute, native($real.add('f.txt')),
+		'link checks resume when dot-dot returns to the existing prefix';
+	my $tail = $base.add('missing').add(('child/' x 3000) ~ 'leaf');
+	is physical($tail).absolute, native($tail), 'a deep nonexistent suffix keeps every component';
 };
 
 subtest 'a dangling link resolves to where it points' => {

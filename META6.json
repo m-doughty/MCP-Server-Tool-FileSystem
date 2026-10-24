@@ -7,7 +7,7 @@
   ],
   "depends": [
     "Digest::SHA256::Native:ver<1.0.0+>:auth<zef:bduggan>",
-    "MCP::Server:ver<0.6.0+>:auth<zef:apogee>",
+    "MCP::Server:ver<0.7.0+>:auth<zef:apogee>",
     "TreeSitter::Native:ver<0.1.0+>:auth<zef:apogee>"
   ],
   "description": "Root-confined filesystem tools for MCP::Server",
@@ -31,5 +31,5 @@
   ],
   "test-depends": [
   ],
-  "version": "0.2.5"
+  "version": "0.3.0"
 }

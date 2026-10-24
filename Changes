@@ -2,6 +2,24 @@ Revision history for MCP::Server::Tool::FileSystem
 
 {{$NEXT}}
 
+0.3.0  2026-10-24T21:44:51+01:00
+    - BUGFIX: [2026-10-24] Resolve configured roots directly with
+      physical-path. On Windows, IO::Path.resolve could duplicate a junction
+      target into the root path, making files under a valid junction root
+      appear missing.
+    - BUGFIX: [2026-10-24] Compare containment by volume and complete path
+      components, and stop probing descendants of a missing/non-directory
+      prefix. A 3,000-part missing path took over a minute on Windows and
+      held the toolkit lock beyond the containment test's deadline. The test
+      now stops on its first timeout instead of queuing further calls behind
+      that worker. The Windows volume cases (drives, drive-letter case, UNC
+      shares) are checked on every host under a Windows stand-in, so a
+      regression shows up before a Windows run.
+    - BUGFIX: [2026-10-24] Require MCP::Server 0.7.0+, which publishes
+      parameter defaults. Version 0.6.0 satisfied the previous dependency
+      pin but failed the schema contract tests because it silently dropped
+      those defaults.
+
 0.2.5  2026-10-24T20:03:29+01:00
     - BUGFIX: [2026-10-24] Windows installs of 0.2.4 failed at the test
       step, in t/11-handles.rakutest, with no leak to find. Windows'
