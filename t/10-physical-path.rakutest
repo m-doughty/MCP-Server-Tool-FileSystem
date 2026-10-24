@@ -1,0 +1,206 @@
+use Test;
+use lib 'lib';
+use MCP::Server;
+use MCP::Server::Tool::FileSystem;
+use MCP::Server::Tool::FileSystem::Test::Kit;
+
+# physical-path is public API: it answers "which file will the operating system
+# actually open for this path?", and containment is only as good as that
+# answer.  So the assertions below do not stop at "the string looks right":
+# wherever a file can be put at each candidate destination, they read the path
+# through the OS and demand that physical-path names the file the OS opened.
+#
+# Directory links are junctions on Windows (creating one needs no privilege)
+# and symlinks elsewhere, so every subtest but one runs on every host.  The
+# exception needs a RELATIVE symbolic link, which Windows only lets Developer
+# Mode or an elevated shell create; the rule it exercises is also pinned as
+# pure string work in the last subtest, which runs everywhere.
+
+plan 8;
+
+my &physical = &MCP::Server::Tool::FileSystem::physical-path;
+my &reparse  = &MCP::Server::Tool::FileSystem::windows-reparse;
+
+my $base = make-sandbox('physical');
+END nuke($base);
+
+# A directory link that the OS follows.
+sub dir-link(IO::Path:D $target, IO::Path:D $link) {
+	if $*DISTRO.is-win {
+		my $p = run 'cmd.exe', '/d', '/c', 'mklink', '/J', $link.absolute, $target.absolute,
+			:out, :err;
+		$p.out.slurp(:close);
+		my $err = $p.err.slurp(:close);
+		die "mklink /J failed for $link: $err" unless $p.exitcode == 0;
+	} else {
+		$target.symlink($link);
+	}
+}
+
+# A symbolic link whose target is the given text, verbatim — relative stays
+# relative.  Rakudo's .symlink absolutifies its invocant, so this goes through
+# the platform's own tool.  False when the host will not let us.
+sub text-link(Str:D $text, IO::Path:D $link, Bool :$dir --> Bool:D) {
+	my $p = $*DISTRO.is-win
+		?? run('cmd.exe', '/d', '/c', 'mklink', |('/D' if $dir), $link.absolute,
+			$text.subst('/', '\\', :g), :out, :err)
+		!! run('ln', '-s', $text, $link.absolute, :out, :err);
+	$p.out.slurp(:close);
+	$p.err.slurp(:close);
+	$p.exitcode == 0 && $link.l;
+}
+
+# The spelling physical-path returns: absolute, and on Windows with the drive
+# letter upper-cased.
+sub native(IO::Path:D $p --> Str:D) {
+	my $abs = $p.absolute;
+	$*DISTRO.is-win ?? $abs.subst(/^ (<[a..z]>) ':'/, { $0.uc ~ ':' }) !! $abs;
+}
+
+my $real = $base.add('real');
+$real.mkdir;
+$real.add('f.txt').spurt('in real');
+
+subtest 'a path with no links is itself' => {
+	plan 3;
+	is physical($real.add('f.txt')).absolute, native($real.add('f.txt')),
+		'an existing file';
+	is physical($real.add('not').add('yet')).absolute, native($real.add('not').add('yet')),
+		'a path that does not exist yet is kept as far as it goes';
+	{
+		temp $*CWD = $real;
+		is physical('f.txt'.IO).absolute, native($real.add('f.txt')),
+			'a relative path is taken from $*CWD';
+	}
+};
+
+subtest 'a directory link is followed, at the end and mid-path' => {
+	plan 4;
+	my $j = $base.add('j');
+	dir-link($real, $j);
+	ok $j.l, 'the link is a link';
+	is physical($j).absolute, native($real), 'the link itself';
+	is physical($j.add('f.txt')).absolute, native($real.add('f.txt')), 'a file under it';
+	is physical($j.add('f.txt')).slurp, 'in real', 'which is the file the OS opens';
+};
+
+subtest 'a chain of links is followed to its end' => {
+	plan 2;
+	my $j2 = $base.add('j2');
+	dir-link($base.add('j'), $j2);
+	is physical($j2.add('f.txt')).absolute, native($real.add('f.txt')), 'two hops';
+	is physical($j2.add('missing').add('deeper')).absolute,
+		native($real.add('missing').add('deeper')),
+		'and a tail that does not exist is kept, under the real directory';
+};
+
+subtest 'a dangling link resolves to where it points' => {
+	plan 1;
+	my $ghost = $base.add('ghost');
+	dir-link($ghost, $base.add('dangling'));
+	is physical($base.add('dangling').add('x')).absolute, native($ghost.add('x')),
+		'the target need not exist';
+};
+
+subtest 'cycles and the hop budget fail closed' => {
+	plan 2;
+	my ($ca, $cb) = $base.add('ca'), $base.add('cb');
+	dir-link($cb, $ca);
+	dir-link($ca, $cb);
+	throws-like { physical($ca.add('x')) }, Exception,
+		message => / 'probable cycle' /, 'a cycle is refused, not looped';
+	throws-like { physical($base.add('j'), :max-hops(0)) }, Exception,
+		message => / 'too long' /, ':max-hops bounds the chase';
+};
+
+# One link, L, from a shallow directory into a deep one; then '..' after it.
+# POSIX resolves '..' against where the walk really is (deep/a); Windows
+# collapses it by name first (one/x.txt).  Each candidate holds a different
+# file, so reading through the OS says which rule this host uses.
+my $one  = $base.add('one');  $one.mkdir;
+my $deep = $base.add('deep'); $deep.mkdir;
+$deep.add('a').mkdir;
+$deep.add('a').add('b').mkdir;
+$one.add('x.txt').spurt('by name');
+$deep.add('a').add('x.txt').spurt('physical');
+dir-link($deep.add('a').add('b'), $one.add('L'));
+
+subtest "'..' after a link follows this platform's rule" => {
+	plan 3;
+	my $p = $one.add('L').add('..').add('x.txt');
+	is $p.slurp, ($*DISTRO.is-win ?? 'by name' !! 'physical'),
+		'the OS opens ' ~ ($*DISTRO.is-win ?? 'one/x.txt: Windows collapses by name'
+		                                 !! 'deep/a/x.txt: POSIX climbs from the target');
+	is physical($p).slurp, $p.slurp, 'physical-path names the file the OS opened';
+	is physical($p).absolute,
+		native($*DISTRO.is-win ?? $one.add('x.txt') !! $deep.add('a').add('x.txt')),
+		'and says so in as many words';
+};
+
+subtest 'a relative link target is judged the way the OS opens it' => {
+	# The containment hole this guards: a link planted inside the root whose
+	# relative target climbs out through '..' after another link.  POSIX and
+	# Windows land in different places; the root check must agree with
+	# whichever this host is, or a link the check thinks stays inside is a
+	# door out.  Here: evil -> L/../../secret.txt, with L at root/L pointing
+	# two levels deeper, at root/x/y.
+	my $root = $base.add('root');
+	$root.mkdir;
+	$root.add('x').mkdir;
+	$root.add('x').add('y').mkdir;
+	$root.add('secret.txt').spurt('INSIDE root');
+	$base.add('secret.txt').spurt('OUTSIDE root');
+	dir-link($root.add('x').add('y'), $root.add('L'));
+	my $evil = $root.add('evil.txt');
+
+	# No `return` in a bare Test block (it is not a routine): branch instead.
+	if text-link('L/../../secret.txt', $evil) {
+		plan 4;
+		my $opened = $evil.slurp;
+		is $opened, ($*DISTRO.is-win ?? 'OUTSIDE root' !! 'INSIDE root'),
+			'the OS opens ' ~ ($*DISTRO.is-win
+				?? 'secret.txt beside the root: Windows collapses L/../.. by name'
+				!! 'root/secret.txt: POSIX climbs from x/y, where L really goes');
+		is physical($evil).slurp, $opened, 'physical-path names the file the OS opened';
+
+		my $server = MCP::Server.new(:name<physical>);
+		$server.plug: MCP::Server::Tool::FileSystem.new(:$root);
+		my %r = call-tool($server, 'fs_read', { path => 'evil.txt' });
+		if $*DISTRO.is-win {
+			ok result-errored(%r), 'so fs_read refuses it';
+			like result-text(%r), / 'escapes the configured root' /, 'as an escape';
+		} else {
+			nok result-errored(%r), 'so fs_read reads it: it really is inside';
+			like result-text(%r), / 'INSIDE root' /, 'and gets the inside file';
+		}
+	} else {
+		skip 'creating a symbolic link on Windows needs Developer Mode or an elevated '
+			~ "shell; the reparse rule itself is pinned by the 'windows-reparse' subtest", 1;
+	}
+};
+
+subtest 'windows-reparse: the rule itself, on every host' => {
+	plan 12;
+	is-deeply reparse('C:', <work proj>, 'L\..\..\secret', ()), ('C:', 'work', 'secret'),
+		"a relative target is joined onto the link's directory and collapsed by name";
+	is-deeply reparse('C:', <work proj>, 'L/../../secret', ()), ('C:', 'work', 'secret'),
+		'forward slashes too';
+	is-deeply reparse('C:', ('a',),'b', <.. c>), ('C:', 'a', 'c'),
+		'what followed the link is collapsed with it';
+	is-deeply reparse('C:', <a b>, 'D:\x\..\y', ('rest',)), ('D:', 'y', 'rest'),
+		'a drive-rooted target replaces the volume and the prefix';
+	is-deeply reparse('C:', ('a',),'c:/x', ()), ('C:', 'x'), 'the drive letter is upper-cased';
+	is-deeply reparse('C:', <a b>, '\x\y', ()), ('C:', 'x', 'y'),
+		'a separator-rooted target keeps the volume and drops the prefix';
+	is-deeply reparse('C:', ('a',),'C:\..\..\x', ()), ('C:', 'x'), "'..' stops at the drive root";
+	is-deeply reparse('C:', ('a',),'\\\\srv\share\..\x', ()), ('//srv/share', 'x'),
+		'a UNC share is a root too';
+	throws-like { reparse('C:', ('a',),'D:x', ()) }, Exception,
+		message => / 'drive-relative' /, 'a drive-relative target is refused';
+	throws-like { reparse('C:', ('a',),'\\\\?\C:\x', ()) }, Exception,
+		message => / 'device-path' /, 'a device path (question mark form) is refused';
+	throws-like { reparse('C:', ('a',),'\\\\.\pipe\x', ()) }, Exception,
+		message => / 'device-path' /, 'and so is the device namespace (dot form)';
+	throws-like { reparse('C:', ('a',),'.. \x', ()) }, Exception,
+		message => / 'dots and spaces' /, "a '.. ' segment is refused, not guessed at";
+};

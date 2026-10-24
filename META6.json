@@ -16,7 +16,9 @@
   "perl": "6.d",
   "provides": {
     "MCP::Server::Tool::FileSystem": "lib/MCP/Server/Tool/FileSystem.rakumod",
-    "MCP::Server::Tool::FileSystem::Map": "lib/MCP/Server/Tool/FileSystem/Map.rakumod"
+    "MCP::Server::Tool::FileSystem::Map": "lib/MCP/Server/Tool/FileSystem/Map.rakumod",
+    "MCP::Server::Tool::FileSystem::Test::FileTimeFixture": "lib/MCP/Server/Tool/FileSystem/Test/FileTimeFixture.rakumod",
+    "MCP::Server::Tool::FileSystem::Test::Kit": "lib/MCP/Server/Tool/FileSystem/Test/Kit.rakumod"
   },
   "resources": [
   ],
@@ -29,5 +31,5 @@
   ],
   "test-depends": [
   ],
-  "version": "0.2.2"
+  "version": "0.2.3"
 }

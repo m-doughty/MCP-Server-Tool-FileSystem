@@ -1,11 +1,10 @@
 use Test;
 use lib 'lib';
-use lib 't/lib';
-use FSTest;
+use MCP::Server::Tool::FileSystem::Test::Kit;
 use MCP::Server;
 use MCP::Server::Tool::FileSystem;
 
-plan 9;
+plan 10;
 
 my $sandbox = make-sandbox('containment');
 my $outside = make-sandbox('outside');
@@ -41,6 +40,12 @@ subtest 'Paths that could leave the root are refused' => {
 		'NUL'                 => 'reserved device name',
 		'nul.txt'             => 'reserved device name',
 		'dir/COM1'            => 'reserved device name',
+		# Windows compares a device name before the first dot, trailing
+		# spaces dropped, and COM/LPT take 0 and the superscripts too.
+		'NUL .txt'            => 'reserved device name',
+		'COM0'                => 'reserved device name',
+		'dir/lpt¹.log'        => 'reserved device name',
+		'CONIN$'              => 'reserved device name',
 	;
 	plan @cases.elems;
 	for @cases -> (:key($path), :value($needle)) {
@@ -235,6 +240,52 @@ subtest 'Symlink chains, relative targets and cycles' => {
 		?? (contains($sandbox, physical($alias)) && !contains($sandbox, physical($chain)))
 		!! True),
 		'physical-path chases to the true destination';
+};
+
+# A client's permission rules judge the name a call spells, so the name the
+# OS opens must be that one. On Windows a ':' (a data stream -- the
+# j::$INDEX_ALLOCATION form reaches through a junction j), a trailing dot or
+# space (dropped) and an 8.3 short name (opened as whichever long name it was
+# given) all open some other name, and are refused. The rule is pure string
+# work, so it is pinned on every host, and the resolver's use of it with a
+# faked $*DISTRO.
+subtest 'On Windows, a segment Windows would read as another name is refused' => {
+	my &hazard = &MCP::Server::Tool::FileSystem::windows-segment-hazard;
+	my @refused = 'j::$INDEX_ALLOCATION', 'x:stream', 'secret.', 'secret ', '...', '. .',
+		'SECRET~1', 'secret~1', 'PROGRA~1.TXT', 'SECRE~A1', '~$DOCU~1.DOC';
+	my @fine = 'secret', 'notes~2024.md', 'foo.txt.~1~', 'report~1.html', 'backup~', '~',
+		'ABCDEFGHI~1', 'a.b.c', '.hidden';
+	plan @refused + @fine + 9;
+
+	ok hazard($_).defined, "'$_' is refused" for @refused;
+	nok hazard($_).defined, "'$_' is a plain name" for @fine;
+
+	{
+		my $*DISTRO = class { method is-win(--> Bool) { True } }.new;
+		errors-with $server, 'fs_read', { path => 'link::$INDEX_ALLOCATION\\secret.txt' },
+			'data stream', 'a stream of a directory is refused';
+		errors-with $server, 'fs_read', { path => 'dir\\j::$INDEX_ALLOCATION\\secret.txt' },
+			'data stream', 'at any depth';
+		errors-with $server, 'fs_read', { path => 'dir\\INNER~1.TXT' },
+			'8.3 short name', 'an 8.3 short name is refused';
+		errors-with $server, 'fs_read', { path => 'ok.txt.' }, 'dot or a space',
+			'a trailing dot is refused';
+		errors-with $server, 'fs_write', { path => 'dir/x ', content => 'no' }, 'dot or a space',
+			'a trailing space is refused, for a write too';
+		nok $sandbox.add('dir').add('x ').e, 'and nothing was written';
+		is result-text(call-tool($server, 'fs_read', { path => 'dir\\inner.txt' })), 'inner',
+			'an ordinary path is still served';
+	}
+
+	{
+		# On POSIX every one of those is an ordinary name: a read of one that
+		# does not exist is "not found", never refused.
+		my $*DISTRO = class { method is-win(--> Bool) { False } }.new;
+		errors-with $server, 'fs_read', { path => 'missing.' }, 'not found',
+			'a trailing dot is a name on POSIX';
+		errors-with $server, 'fs_read', { path => 'MISSIN~1' }, 'not found',
+			'and so is a tilde';
+	}
 };
 
 subtest 'A recursive delete unlinks symlinks instead of following them' => {

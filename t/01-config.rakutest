@@ -1,7 +1,6 @@
 use Test;
 use lib 'lib';
-use lib 't/lib';
-use FSTest;
+use MCP::Server::Tool::FileSystem::Test::Kit;
 use MCP::Server;
 use MCP::Server::Tool::FileSystem;
 

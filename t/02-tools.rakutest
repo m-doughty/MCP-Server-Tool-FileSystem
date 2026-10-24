@@ -1,7 +1,7 @@
 use Test;
 use lib 'lib';
-use lib 't/lib';
-use FSTest;
+use MCP::Server::Tool::FileSystem::Test::FileTimeFixture;
+use MCP::Server::Tool::FileSystem::Test::Kit;
 use MCP::Server;
 use MCP::Server::Tool::FileSystem;
 
@@ -124,7 +124,7 @@ subtest 'glob' => {
 };
 
 subtest 'stat' => {
-	plan 6;
+	plan 7;
 	my $server = fs-server();
 	my %stat = result-text(call-tool($server, 'fs_stat', { path => 'tree/alpha.txt' }))
 		.lines.map({ .split(': ', 2) }).map({ .[0] => .[1] }).Hash;
@@ -133,6 +133,14 @@ subtest 'stat' => {
 	is %stat<size>, '14', 'Byte size';
 	ok %stat<modified> ~~ /^ \d**4 '-' \d\d '-' \d\d 'T' \d\d ':' \d\d ':' \d\d 'Z' $/,
 		'Modification time is ISO 8601 UTC';
+	# And it is the right time: IO::Path.modified, which this used to read,
+	# is 1969 on 64-bit Windows and 37 seconds early everywhere else.
+	my $dated = $sandbox.add('scratch').add('dated.txt');
+	$dated.spurt('x');
+	set-file-mtime($dated, DateTime.new('2021-06-15T12:34:56Z').Instant);
+	is result-text(call-tool($server, 'fs_stat', { path => 'scratch/dated.txt' }))
+		.lines.first(*.starts-with('modified')),
+		'modified: 2021-06-15T12:34:56Z', 'Modification time is the one the file has';
 	is %stat<readable>, 'yes', 'Readable flag';
 
 	is result-text(call-tool($server, 'fs_stat', { path => 'tree' })).lines.first(*.starts-with('type')),
@@ -344,15 +352,19 @@ subtest 'grep' => {
 		"No matches for 'zzz' under 'scratch/grep'", 'No matches says so, the way glob does';
 
 	# Binary and mis-encoded files are skipped rather than sprayed across the
-	# answer, and the count says how many were passed over.
+	# answer, and nothing is said about it. The notice that used to count them
+	# is gone: ripgrep, which picks the candidate files when it is installed,
+	# passes a binary file over in silence and cannot be made to report one, so
+	# counting them here would have made the answer depend on which tier served
+	# it. t/07-grep-parity.rakutest is the test that holds the tiers together.
 	my $bindir = $sandbox.add('scratch').add('grep-bin');
 	$bindir.mkdir;
 	$bindir.add('ok.txt').spurt("alpha in text\n");
 	$bindir.add('image.dat').spurt(Buf.new(0x89, 0x50, 0x00, 0x01, 0x61, 0x6c, 0x70, 0x68, 0x61));
 	$bindir.add('latin.txt').spurt(Buf.new(0xff, 0xe9, 0x0a));
 	is result-text(call-tool($server, 'fs_grep', { pattern => 'alpha', path => 'scratch/grep-bin' })),
-		"scratch/grep-bin/ok.txt:1:alpha in text\n\n[skipped 2 files that are not UTF-8 text]",
-		'A NUL-bearing file and a non-UTF-8 file are both skipped and counted';
+		'scratch/grep-bin/ok.txt:1:alpha in text',
+		'A NUL-bearing file and a non-UTF-8 file are both passed over in silence';
 
 	errors-with $server, 'fs_grep', { pattern => 'a(b', path => 'scratch/grep', regex => True },
 		"Invalid regex pattern 'a(b'", 'A malformed regex is a clean error, not a crash';

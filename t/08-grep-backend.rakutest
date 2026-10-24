@@ -1,0 +1,502 @@
+use Test;
+use lib 'lib';
+use MCP::Server::Tool::FileSystem::Test::Kit;
+use MCP::Server;
+use MCP::Server::Tool::FileSystem;
+
+# How fs_grep picks the tool that picks its candidate files, how long it
+# remembers the answer, and which of that tool's answers it believes.
+#
+# A probe is a process spawn. Paying one per search on a host with no ripgrep
+# would cost more than the tier saves, so a verdict is taken once per binary
+# and kept for the life of the process: the "no" as firmly as the "yes". A
+# probe that got no answer at all is not a verdict, and is asked again. After
+# the probe, a search decides only whether its own answer can be believed,
+# and one that cannot costs that search a full scan and not the tier -- until
+# five in a row have not been believed, which drops it. A search that finds
+# the searcher's binary gone drops it at once, as a probe that could not find
+# it would have. And reset-searchers forgets all of it. Every
+# assertion below is on the spawn counter or on the answer, because a cache
+# you cannot count is a cache you cannot claim, and a candidate list nobody
+# can see is one nobody can say was believed.
+#
+# Two kinds of fake. A name nothing on any platform installs, which cannot be
+# spawned at all. And stand-in searchers this file writes for itself -- a
+# shell script on POSIX, a batch file on Windows -- because the behaviours
+# under test are ones no real searcher shows on demand: a list cut short by a
+# signal, an exit status no documentation mentions, an error exit with
+# nothing to say. Each answers --version (or refuses to) and then prints
+# exactly the list, the message and the exit status it was written with. The
+# real tools are held to the same rules in t/07, against a root holding a
+# file nobody may read.
+
+# One subtest needs signals, which only POSIX has; the plan and that subtest
+# read the same flag, so they cannot disagree.
+my Bool:D $signals = !$*DISTRO.is-win;
+plan 15 + $signals;
+
+my $sandbox = make-sandbox('grep-backend');
+END nuke($sandbox);
+
+$sandbox.add('sub').mkdir;
+$sandbox.add('a.txt').spurt("alpha one\nbeta two\n");
+$sandbox.add('sub').add('b.txt').spurt("alpha in sub\n");
+
+my $server = MCP::Server.new(:name<fs-backend>);
+$server.plug: MCP::Server::Tool::FileSystem.new(:root($sandbox));
+
+my constant ANSWER = "a.txt:1:alpha one\nsub/b.txt:1:alpha in sub";
+
+sub search(--> Str:D) {
+	result-text(call-tool($server, 'fs_grep', { pattern => 'alpha' }));
+}
+
+sub backend(--> Str:D) { MCP::Server::Tool::FileSystem::grep-backend() }
+sub spawns(--> Int:D)  { MCP::Server::Tool::FileSystem::grep-backend-spawns() }
+sub believed(--> Int:D) { MCP::Server::Tool::FileSystem::grep-backend-believed() }
+my &reset-searchers = &MCP::Server::Tool::FileSystem::reset-searchers;
+
+#| Is this tier usable with its ordinary binary? Asked with the overrides
+#| cleared, so a fake left behind by an earlier subtest cannot answer for it.
+sub tier-usable(Str:D $tier --> Bool:D) {
+	%*ENV<MCP_FS_GREP_RG_BINARY>:delete;
+	%*ENV<MCP_FS_GREP_GREP_BINARY>:delete;
+	%*ENV<MCP_FS_GREP_BACKEND> = $tier;
+	backend() eq $tier;
+}
+
+# Where the stand-ins live: outside the root, so no search ever finds them.
+my $bin = make-sandbox('grep-backend-bin');
+END nuke($bin);
+
+#| Where a stand-in called $name goes. A batch file on Windows, where only
+#| the extension makes a file runnable.
+sub stand-in-path(Str:D $name --> IO::Path:D) {
+	$bin.add($*DISTRO.is-win ?? "$name.cmd" !! $name);
+}
+
+#| Write a stand-in searcher at $at and return it. Asked for --version, it
+#| prints a version and exits 0 -- or, with :!answers-version, prints nothing
+#| and exits 1. Asked for anything else, it prints @names, one per line, then
+#| $stderr if there is one, then exits with $exit, or with :killed (POSIX
+#| only) has itself killed by SIGKILL instead. Written as bytes, so Windows
+#| gets the CRLF a batch file needs and POSIX the LF a shell script does.
+sub stand-in(IO::Path:D $at, :@names, Str :$stderr, Int :$exit = 0,
+	Bool :$killed = False, Bool :$answers-version = True --> IO::Path:D
+) {
+	my Str $script;
+	if $*DISTRO.is-win {
+		die 'a batch file cannot be killed by a signal' if $killed;
+		# Outside any ( ) block, so a ')' in a path cannot end one early;
+		# cmd's own metacharacters escaped, so a path is echoed as it is.
+		my sub echo(Str:D $text) { 'echo ' ~ $text.subst(/(<[&|<>^()]>)/, { '^' ~ $0 }, :g).subst('%', '%%', :g) }
+		$script = (
+			'@echo off',
+			'if "%~1"=="--version" goto version',
+			|@names.map({ echo($_) }),
+			|($stderr.defined ?? (echo($stderr) ~ ' 1>&2',) !! ()),
+			"exit /b $exit",
+			':version',
+			|($answers-version ?? ('echo stand-in searcher 1.0', 'exit /b 0') !! ('exit /b 1',)),
+		).join("\r\n") ~ "\r\n";
+	} else {
+		my sub quoted(Str:D $text) { "'" ~ $text.subst("'", "'\\''", :g) ~ "'" }
+		$script = (
+			'#!/bin/sh',
+			'if [ "$1" = "--version" ]; then',
+			($answers-version ?? "\tprintf '%s\\n' 'stand-in searcher 1.0'\n\texit 0" !! "\texit 1"),
+			'fi',
+			|@names.map({ "printf '%s\\n' " ~ quoted($_) }),
+			|($stderr.defined ?? ("printf '%s\\n' " ~ quoted($stderr) ~ ' >&2',) !! ()),
+			($killed ?? 'kill -9 $$' !! "exit $exit"),
+		).join("\n") ~ "\n";
+	}
+	$at.spurt($script.encode('utf-8'));
+	$at.chmod(0o755) unless $*DISTRO.is-win;
+	$at;
+}
+
+#| Point the ripgrep tier at $binary, whatever is installed here.
+sub use-searcher(IO::Path:D $binary --> Nil) {
+	%*ENV<MCP_FS_GREP_GREP_BINARY>:delete;
+	%*ENV<MCP_FS_GREP_BACKEND>   = 'ripgrep';
+	%*ENV<MCP_FS_GREP_RG_BINARY> = $binary.absolute;
+}
+
+#| Assert the stand-in at $at passed its probe. When it did not, the stand-in
+#| itself could not be run here -- the harness failing, not the pack -- and
+#| the diagnostic says so, so a red test on a new platform is not read as the
+#| rule being broken.
+sub stand-in-probed(IO::Path:D $at, Str:D $description --> Bool:D) {
+	my Bool:D $ok = is backend(), 'ripgrep', $description;
+	diag "the stand-in searcher at '$at' could not be run as a program on this host: "
+		~ 'every assertion after this one is about the harness, not the pack'
+		unless $ok;
+	$ok;
+}
+
+# Every stand-in that names a file names this one and not sub/b.txt, so an
+# answer that holds sub/b.txt is one the scan found for itself: the list was
+# not believed.
+my Str:D $named = $sandbox.add('a.txt').absolute;
+# And the full list, for a stand-in that answers properly.
+my @both = $named, $sandbox.add('sub').add('b.txt').absolute;
+
+subtest 'a searcher that cannot be spawned is probed once and never again' => {
+	plan 6;
+
+	%*ENV<MCP_FS_GREP_BACKEND> = 'ripgrep';
+	%*ENV<MCP_FS_GREP_RG_BINARY> = 'mcp-fs-no-such-searcher-7f3a';
+
+	my Int:D $before = spawns();
+	is backend(), 'raku',
+		'A binary that is not there leaves the search on the Raku scan';
+	is spawns() - $before, 1, 'having been tried exactly once';
+
+	is backend(), 'raku', 'The verdict stands on the next call';
+	is spawns() - $before, 1, 'and costs no second spawn';
+
+	my @answers = (^3).map({ search() });
+	is spawns() - $before, 1,
+		'Nor does a search go looking for it again: the "no" is cached like the "yes"';
+	is-deeply @answers.unique.List, (ANSWER,),
+		'And the searches answer exactly as they would with no searcher at all';
+};
+
+subtest 'a probe that could not be launched is asked again' => {
+	plan 8;
+
+	# The moment failing rather than the tool: a process out of file
+	# descriptors, a system out of processes, a binary being rewritten by an
+	# upgrade. All of them are a spawn that fails while the binary is there,
+	# and none of them is a reason to go without the searcher for the rest of
+	# the process. Staged with a directory where the binary should be -- there,
+	# and impossible to launch, on every OS. That is not an exhausted
+	# descriptor table, but it is the same outcome to the probe, and the
+	# outcome is all the probe can see.
+	my $at = stand-in-path('later');
+	$at.mkdir;
+	use-searcher($at);
+
+	my Int:D $before = spawns();
+	is backend(), 'raku', 'A searcher that is there but cannot be launched is not used';
+	is spawns() - $before, 1, 'having been tried once';
+	is backend(), 'raku', 'nor is it used on the next call';
+	is spawns() - $before, 2, 'which asks it again rather than remembering a "no"';
+
+	$at.rmdir;
+	stand-in($at, names => ($named, $sandbox.add('sub').add('b.txt').absolute));
+	stand-in-probed($at, 'Once it can be launched, it is used');
+	is spawns() - $before, 3, 'on one more probe';
+	is search(), ANSWER, 'and it answers a search';
+	backend();
+	is spawns() - $before, 4, 'and the "yes" is remembered: only that search spawned anything';
+};
+
+subtest 'a probe that ran and gave no version is remembered as a no' => {
+	plan 4;
+
+	use-searcher(stand-in(stand-in-path('no-version'), :!answers-version));
+
+	my Int:D $before = spawns();
+	is backend(), 'raku', 'A searcher that exits 1 for --version is not used';
+	is spawns() - $before, 1, 'on one probe';
+	is backend(), 'raku', 'The verdict stands on the next call';
+	is spawns() - $before, 1, 'and costs no second spawn: a wrong answer is an answer';
+};
+
+subtest 'a search the searcher refuses costs that search, not the tier' => {
+	plan 7;
+
+	# The refusal every grep and ripgrep makes for an option it does not know:
+	# exit 2, with a message saying so. The list it printed first is not
+	# believed, and the scan answers in full.
+	my $at = stand-in(stand-in-path('refuses'),
+		names => ($named,), stderr => 'stand-in: unrecognized option', exit => 2);
+	use-searcher($at);
+
+	my Int:D $before          = spawns();
+	my Int:D $believed-before = believed();
+	stand-in-probed($at, 'A searcher that answers --version is taken at its word');
+	is search(), ANSWER, 'The search it then refuses is answered in full, by the Raku scan';
+	is spawns() - $before, 2, 'having asked it exactly once';
+	is backend(), 'ripgrep', 'and the searcher is kept';
+	is search(), ANSWER, 'So the next search is answered in full too';
+	is spawns() - $before, 3, 'having asked it again';
+	is believed() - $believed-before, 0, 'and neither refusal was believed';
+};
+
+subtest 'a searcher whose binary has gone is dropped by the first search that misses it' => {
+	plan 8;
+
+	# Hundreds of searches would each pay a spawn that cannot succeed. A
+	# searcher that passed its probe and then cannot be launched is looked
+	# for again, and when its binary is no longer there it is dropped as if
+	# its probe had said no. Staged by taking the stand-in away.
+	my $at = stand-in(stand-in-path('vanishes'),
+		names => ($named, $sandbox.add('sub').add('b.txt').absolute));
+	use-searcher($at);
+
+	my Int:D $before = spawns();
+	stand-in-probed($at, 'The stand-in passes its probe');
+	is search(), ANSWER, 'and answers a search';
+
+	$at.unlink;
+	is search(), ANSWER, 'A search whose searcher has gone is answered anyway, by the Raku scan';
+	is spawns() - $before, 3, 'having tried to start it exactly once more';
+	is backend(), 'raku', 'and the searcher is dropped, as if its probe had said no';
+
+	my @later = (^3).map({ search() });
+	is-deeply @later.unique.List, (ANSWER,), 'The searches after it are answered';
+	is spawns() - $before, 3, 'and spawn nothing: they go straight to the Raku scan';
+
+	stand-in($at, names => ($named,));
+	backend();
+	is spawns() - $before, 3,
+		'A binary that comes back is picked up at the next start, like one newly installed';
+};
+
+subtest 'a searcher that is there but cannot be started is tried again on the next search' => {
+	plan 8;
+
+	# The same failed launch with the binary still in place is the moment
+	# failing -- out of file descriptors, out of processes -- and the next
+	# search tries again. Staged, as for the probe, with a directory put where
+	# the stand-in was: there, and impossible to launch, on every OS.
+	my $at = stand-in(stand-in-path('jammed'),
+		names => ($named, $sandbox.add('sub').add('b.txt').absolute));
+	use-searcher($at);
+
+	my Int:D $before          = spawns();
+	my Int:D $believed-before = believed();
+	stand-in-probed($at, 'The stand-in passes its probe');
+	is search(), ANSWER, 'and answers a search';
+
+	$at.unlink;
+	$at.mkdir;
+	is search(), ANSWER, 'A search whose searcher cannot be started is answered anyway, by the Raku scan';
+	is spawns() - $before, 3, 'having tried to start it exactly once more';
+	is backend(), 'ripgrep', 'and the searcher is kept: its binary is still there';
+	search();
+	is spawns() - $before, 4, 'So the next search tries it again rather than giving up on it';
+
+	$at.rmdir;
+	stand-in($at, names => ($named, $sandbox.add('sub').add('b.txt').absolute));
+	is search(), ANSWER, 'Once it can be started, it answers again';
+	is believed() - $believed-before, 2, 'and its list is believed, as the first one was';
+};
+
+#| The assertions for a searcher whose list is cut short and so must not be
+#| believed, however it ended. $how says how, for the descriptions.
+sub not-believed(IO::Path:D $at, Str:D $how --> Nil) {
+	use-searcher($at);
+
+	my Int:D $before          = spawns();
+	my Int:D $believed-before = believed();
+	stand-in-probed($at, 'The stand-in passes its probe');
+	is search(), ANSWER, "A list $how is not believed: the scan answers in full, sub/b.txt included";
+	is spawns() - $before, 2, 'having asked the searcher once';
+	is backend(), 'ripgrep', 'and the searcher is kept: one bad answer costs one search';
+	is search(), ANSWER, 'So the next search is answered in full too';
+	is spawns() - $before, 3, 'having asked it again';
+	is believed() - $believed-before, 0, 'and neither list was believed';
+}
+
+subtest 'a list that ends in an exit status no documentation gives is not believed' => {
+	plan 7;
+	not-believed(stand-in(stand-in-path('exits-3'), names => ($named,), exit => 3),
+		'followed by exit 3');
+};
+
+if $signals {
+	# POSIX only, because only POSIX has signals. Rakudo reports a child
+	# killed by one as exit code 0, the code that means "here is the list".
+	subtest 'a list cut short by a signal is not believed' => {
+		plan 7;
+		not-believed(stand-in(stand-in-path('killed'), names => ($named,), :killed),
+			'cut short by SIGKILL');
+	};
+}
+
+subtest 'an error exit with nothing to say is believed' => {
+	plan 6;
+
+	# What ripgrep and both greps do, told to keep quiet about unreadable
+	# files, when the root holds one: exit 2, stderr empty, every readable
+	# match listed. The scan cannot read that file either, so the list is the
+	# one a clean run would have printed. The stand-in names only a.txt, so
+	# the answer shows whose list it came from.
+	my $at = stand-in(stand-in-path('soft-error'), names => ($named,), exit => 2);
+	use-searcher($at);
+
+	my Int:D $before          = spawns();
+	my Int:D $believed-before = believed();
+	stand-in-probed($at, 'The stand-in passes its probe');
+	is search(), 'a.txt:1:alpha one', 'Its list is believed: the scan opened only the file it named';
+	is spawns() - $before, 2, 'having asked the searcher once';
+	is backend(), 'ripgrep', 'and the searcher is kept';
+	is search(), 'a.txt:1:alpha one', 'as it is on the next search';
+	is believed() - $believed-before, 2, 'Both lists were believed';
+};
+
+subtest 'five untrusted answers in a row drop the searcher' => {
+	plan 6;
+
+	# SEARCHER-UNTRUSTED-LIMIT, which is 5: one bad answer is as likely to be
+	# the moment as the tool, five in a row is the tool.
+	my $at = stand-in(stand-in-path('refuses-five'), names => ($named,), exit => 3);
+	use-searcher($at);
+
+	my Int:D $before = spawns();
+	stand-in-probed($at, 'The stand-in passes its probe');
+	my @answers = (^4).map({ search() });
+	is backend(), 'ripgrep', 'Four untrusted answers in a row leave it in use';
+	@answers.push: search();
+	is backend(), 'raku', 'and the fifth drops it';
+	is spawns() - $before, 6, 'having asked it five times after its probe';
+	@answers.push: search();
+	is spawns() - $before, 6, 'so the sixth search spawns nothing';
+	is-deeply @answers.unique.List, (ANSWER,), 'and all six were answered in full, by the scan';
+};
+
+subtest 'a believed answer starts the count again' => {
+	plan 4;
+
+	my $at = stand-in-path('mostly-refuses');
+	my sub refusing(--> IO::Path:D)  { stand-in($at, names => ($named,), exit => 3) }
+	my sub answering(--> IO::Path:D) { stand-in($at, names => @both) }
+	use-searcher(refusing());
+
+	my Int:D $believed-before = believed();
+	stand-in-probed($at, 'The stand-in passes its probe');
+	search() for ^4;
+	answering();
+	search();
+	refusing();
+	search() for ^4;
+	is backend(), 'ripgrep',
+		'Four untrusted answers, one believed, four more: still in use, as the count started again';
+	is believed() - $believed-before, 1, 'and the one in the middle was believed';
+	search();
+	is backend(), 'raku', 'The fifth untrusted answer in a row after it drops the searcher';
+};
+
+subtest 'a launch that fails while the binary is there never counts' => {
+	plan 4;
+
+	# The descriptor table full, the process table full: the moment, not the
+	# tool. Staged, as before, with a directory where the stand-in was.
+	my $at = stand-in-path('refuses-and-jams');
+	use-searcher(stand-in($at, names => ($named,), exit => 3));
+
+	my Int:D $before = spawns();
+	stand-in-probed($at, 'The stand-in passes its probe');
+	search() for ^4;
+	$at.unlink;
+	$at.mkdir;
+	search() for ^3;
+	is backend(), 'ripgrep',
+		'Four untrusted answers and three failed launches leave it in use: the launches did not count';
+
+	$at.rmdir;
+	stand-in($at, names => ($named,), exit => 3);
+	search();
+	is backend(), 'raku', 'One more untrusted answer, the fifth, drops it: nor did the launches clear the count';
+	is spawns() - $before, 9, 'one probe, eight searches that reached it or tried to';
+};
+
+subtest 'reset-searchers asks every searcher again, from scratch' => {
+	plan 10;
+
+	# One searcher dropped after five untrusted answers, one whose probe said
+	# no; both then fixed, which neither verdict notices on its own. And one
+	# four untrusted answers into a run of them, which the reset clears too.
+	my $counting = stand-in(stand-in-path('reset-counting'), names => ($named,), exit => 3);
+	use-searcher($counting);
+	search() for ^4;
+
+	my $dropped = stand-in(stand-in-path('reset-dropped'), names => ($named,), exit => 3);
+	use-searcher($dropped);
+	search() for ^5;
+	stand-in($dropped, names => @both);
+	is backend(), 'raku', 'A dropped searcher stays dropped once it would answer properly';
+
+	my $refused = stand-in(stand-in-path('reset-no'), :!answers-version);
+	use-searcher($refused);
+	is backend(), 'raku', 'and so does one whose probe said no';
+	stand-in($refused, names => @both);
+
+	my Int:D $before          = spawns();
+	my Int:D $believed-before = believed();
+	reset-searchers();
+	is spawns(), $before, 'A reset spawns nothing by itself';
+
+	stand-in-probed($refused, 'After it, the searcher whose probe said no is probed again and used');
+	is search(), ANSWER, 'and answers';
+	use-searcher($dropped);
+	stand-in-probed($dropped, 'and so is the one that was dropped');
+	is search(), ANSWER, 'which answers too';
+	is believed() - $believed-before, 2, 'Both lists were believed';
+	is spawns() - $before, 4, 'on two probes and two searches, nothing more';
+
+	use-searcher($counting);
+	search();
+	is backend(), 'ripgrep',
+		'A searcher four untrusted answers in before the reset is not dropped by one more after it';
+};
+
+subtest 'reset-searchers is safe to repeat, and to call while searches run' => {
+	plan 3;
+
+	my $at = stand-in(stand-in-path('busy'), names => @both);
+	use-searcher($at);
+	reset-searchers() for ^3;
+	stand-in-probed($at, 'Three resets in a row break nothing: the searcher is probed and used');
+
+	my @searching = (^4).map({ start { (^10).map({ search() }).eager.List } });
+	my $resetting = start { reset-searchers() for ^20; True };
+	my @answers   = (await @searching).map(*.Slip);
+	ok (await $resetting), 'Twenty resets ran alongside forty searches without one failing';
+	is-deeply @answers.unique.List, (ANSWER,), 'and every one of the forty searches answered in full';
+};
+
+subtest 'the backend setting chooses, and is checked' => {
+	plan 4;
+
+	my Bool:D $ripgrep = tier-usable('ripgrep');
+	my Bool:D $grep    = tier-usable('grep');
+
+	%*ENV<MCP_FS_GREP_BACKEND>:delete;
+	is backend(), ($ripgrep ?? 'ripgrep' !! $grep ?? 'grep' !! 'raku'),
+		'Unset, the first usable searcher wins: ripgrep, then grep, then the Raku scan';
+
+	%*ENV<MCP_FS_GREP_BACKEND> = 'raku';
+	my Int:D $before = spawns();
+	is backend(), 'raku', "'raku' pins the search to the scan";
+	is spawns(), $before, 'and never spawns anything to find that out';
+
+	%*ENV<MCP_FS_GREP_BACKEND> = 'wobble';
+	errors-with $server, 'fs_grep', { pattern => 'alpha' },
+		'must be one of auto, ripgrep, grep or raku',
+		'A setting that names no tier is a clean error, not a silent fallback';
+};
+
+subtest 'every tier gives the same answer for a search of one file' => {
+	plan 3;
+
+	# A single file is never handed to an external searcher: there is one
+	# candidate and choosing it would be pure overhead. Whatever the setting
+	# says, nothing is spawned and the answer is the scan's.
+	for <ripgrep grep raku> -> $tier {
+		%*ENV<MCP_FS_GREP_RG_BINARY>:delete;
+		%*ENV<MCP_FS_GREP_GREP_BINARY>:delete;
+		%*ENV<MCP_FS_GREP_BACKEND> = $tier;
+		backend();   # probe first, so the count below is only about the search
+
+		my Int:D $before = spawns();
+		my $text = result-text(call-tool($server, 'fs_grep',
+			{ pattern => 'alpha', path => 'a.txt' }));
+		ok $text eq 'a.txt:1:alpha one' && spawns() == $before,
+			"With the backend set to $tier, a one-file search answers from the scan and spawns nothing";
+	}
+};

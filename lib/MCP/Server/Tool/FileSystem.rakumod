@@ -16,6 +16,34 @@ use MCP::Server::Tool::FileSystem::Map;
 #| gets a usable filesystem without getting the whole machine.
 unit class MCP::Server::Tool::FileSystem does MCP::Server::Toolkit;
 
+# Rakudo 2026.09 builds $*DISTRO afresh on every read instead of once per
+# process: its lazy initialiser files the object it built under the key
+# '$*DISTRO', and the lookup only ever asks for '$DISTRO'.  On macOS each
+# build runs sw_vers and leaves the pipe it read the answer from open, so
+# every read costs a process and a file descriptor that is never given back.
+# This pack asks $*DISTRO for every path component it splits, chases or
+# compares — a dozen times per fs_read, at least once per file a search
+# walks — so a server at macOS's default limit of 256 descriptors ran out
+# within a few dozen calls: ripgrep could no longer be started, and then
+# nothing could be opened at all.  Filing the object under the key the
+# lookup reads makes it the one every later read returns, as on every other
+# release; where the key is already there, which is everywhere the bug is
+# not, nothing is filed.
+#
+# Only a real Distro is filed.  A module loaded inside a test's stand-in
+# $*DISTRO (`my $*DISTRO = class { method is-win { True } }.new`, the usual
+# way to exercise a Windows branch on another OS) reads the stand-in here,
+# and filing that would make it the whole process's for good; such a process
+# is left to Rakudo's own behaviour instead.
+#
+# The bug came in with rakudo/rakudo a22cab8f9 (2026-09-02); delete this
+# once no supported Rakudo has it.
+unless PROCESS::<$DISTRO>:exists {
+	my $distro := $*DISTRO;
+	PROCESS::<$DISTRO> := $distro
+		if $distro ~~ Distro:D && !(PROCESS::<$DISTRO>:exists);
+}
+
 has IO::Path() $.root is required;
 has Bool:D $.read-only = False;
 has Lock $!mutation-lock .= new;
@@ -31,6 +59,13 @@ has Lock $!map-lock .= new;
 
 my constant REVISION-SCHEME = 'sha256-v1';
 my constant EXPECTED-REVISIONS = '_expected-revisions';
+
+# The lock the scanning phase of every grep runs under, whichever tier chose
+# the files it looks at.  Module-level rather than per-instance, and declared
+# up here rather than beside the rest of the searcher machinery at the foot of
+# the file, only because Raku wants a variable declared before the line that
+# uses it.  What it is for is in the "External searchers" block down there.
+my $grep-scan-lock = Lock.new;
 
 #| The MCP annotations every reading tool in this pack carries: it changes
 #| nothing under the root, and calling it again with the same arguments adds
@@ -118,6 +153,7 @@ method register($registrar) {
 			path => {
 				type        => 'string',
 				description => 'Directory path relative to the root; defaults to the root itself',
+				default     => '.',
 			},
 		},
 		handler => -> :%args {
@@ -142,6 +178,7 @@ method register($registrar) {
 			path => {
 				type        => 'string',
 				description => 'Directory to search below, relative to the root; defaults to the root itself',
+				default     => '.',
 			},
 		},
 		handler => -> :%args {
@@ -172,8 +209,8 @@ method register($registrar) {
 			~ 'Raku regex and not a PCRE one: classes, quantifiers, alternation and '
 			~ 'anchors read the same, but a space is not literal unless quoted and a '
 			~ 'pattern carrying a code block is refused. Files that are not UTF-8 '
-			~ 'text are skipped and counted, and the search stops once max-results '
-			~ 'lines have matched.',
+			~ 'text are skipped, and the search stops once max-results lines '
+			~ 'have matched.',
 		params => {
 			pattern => {
 				type        => 'string',
@@ -183,22 +220,27 @@ method register($registrar) {
 			path => {
 				type        => 'string',
 				description => 'File to search, or directory to search below, relative to the root; defaults to the root itself',
+				default     => '.',
 			},
 			regex => {
 				type        => 'boolean',
 				description => 'Treat pattern as a Raku regex instead of literal text; defaults to false',
+				default     => False,
 			},
 			glob => {
 				type        => 'string',
 				description => 'Only search files whose name matches this wildcard, e.g. "*.raku"; may not contain "/"',
+				default     => '',
 			},
 			'context' => {
 				type        => 'integer',
 				description => 'Lines of surrounding context to show around each match, 0 to 20; defaults to 0',
+				default     => 0,
 			},
 			'max-results' => {
 				type        => 'integer',
 				description => 'Stop after this many matching lines, 1 to 1000; defaults to 50',
+				default     => 50,
 			},
 		},
 		handler => -> :%args {
@@ -227,18 +269,22 @@ method register($registrar) {
 			path => {
 				type        => 'string',
 				description => 'Directory to map, relative to the root; defaults to the root itself',
+				default     => '.',
 			},
 			query => {
 				type        => 'string',
 				description => 'Space-separated identifiers or words to focus the map on; matching files and symbols rank higher',
+				default     => '',
 			},
 			focus => {
 				type        => 'string',
 				description => 'Space- or comma-separated file paths, relative to the root, to weight heavily',
+				default     => '',
 			},
 			'max-chars' => {
 				type        => 'integer',
 				description => 'Upper bound on the size of the map in characters, 512 to 65536; defaults to 8192',
+				default     => 8192,
 			},
 		},
 		handler => -> :%args {
@@ -318,6 +364,7 @@ method register($registrar) {
 			'replace-all' => {
 				type        => 'boolean',
 				description => 'Replace every occurrence instead of insisting on a unique one; defaults to false',
+				default     => False,
 			},
 		},
 		handler => -> :%args {
@@ -371,6 +418,7 @@ method register($registrar) {
 			recursive => {
 				type        => 'boolean',
 				description => 'Delete a non-empty directory and its whole contents; defaults to false',
+				default     => False,
 			},
 		},
 		handler => -> :%args {
@@ -659,15 +707,30 @@ method !grep-files(
 	my $target = self!resolve($rel);
 	die "Path not found: '$rel'" unless $target.e;
 
+	# Which files the scan below will even open, chosen by an external searcher
+	# when there is one that can answer this question identically — see the
+	# "External searchers" section for what that costs and why.  Deliberately
+	# outside the scan lock: this is the part that is allowed to run in
+	# parallel.  An undefined Set means "no list": scan everything.
+	my $candidates = $target.d && !$regex && externally-searchable($pattern)
+		?? external-candidates($pattern, $target)
+		!! Set;
+
 	my @base = relative-parts($!root, $target);
 	my @out;
 	my Int:D $matched = 0;
-	my Int:D $skipped = 0;
 
 	# Returns False once the result budget is spent, which stops the walk.
 	my sub scan(IO::Path:D $file, Str:D $display --> Bool:D) {
 		return True unless $file.f;
 		return True if $glob ne '' && !glob-match($glob, $file.basename);
+		# A file an external searcher looked at and did not name cannot contain
+		# the pattern, so it is never opened.  The ones it could not have
+		# looked at — symlinks, names carrying a line break — are opened
+		# regardless: its silence says nothing about them.
+		if $candidates.defined && !unreportable-file($file) {
+			return True unless $candidates{search-key($file.absolute)};
+		}
 		# A symlink inside the root may point outside it.  The walk already
 		# refuses to descend symlinked directories; this is the same rule for
 		# the files themselves, so a planted link cannot be read out through
@@ -683,16 +746,15 @@ method !grep-files(
 
 		my $bytes = try $file.slurp(:bin);
 		return True without $bytes;   # unreadable: skipped like an unreadable directory
-		if looks-binary($bytes) {
-			$skipped++;
-			return True;
-		}
+		# Binary and mis-encoded files are passed over in silence.  They used
+		# to be counted in a trailing notice, and that notice is gone: an
+		# external searcher skips a binary file without saying so, and one
+		# answer the model cannot tell the tiers apart by is worth more than
+		# the count was.
+		return True if looks-binary($bytes);
 		my Str $why;
 		my $text = decode-text($bytes, $why);
-		without $text {
-			$skipped++;
-			return True;
-		}
+		return True without $text;
 
 		my @lines = $text.lines;
 		my @hits  = (^@lines).grep({
@@ -724,20 +786,22 @@ method !grep-files(
 		$matched < $max;
 	}
 
-	if $target.d {
-		walk-tree($target, -> $entry, @parts { scan($entry, (|@base, |@parts).join('/')) });
-	} else {
-		scan($target, @base.join('/'));
+	# One process-wide lock around the whole walk-and-read phase, on every
+	# tier.  On the Raku tier it is what keeps concurrent searches from killing
+	# the VM outright; on the external tiers the candidate list is short and
+	# the lock is held for almost no time at all.
+	$grep-scan-lock.protect: {
+		if $target.d {
+			walk-tree($target, -> $entry, @parts { scan($entry, (|@base, |@parts).join('/')) });
+		} else {
+			scan($target, @base.join('/'));
+		}
 	}
 
 	my @notices;
 	if $matched >= $max {
 		my Str:D $lines = $max == 1 ?? 'line' !! 'lines';
 		@notices.push: "[stopped at $max matching $lines; raise max-results to see more]";
-	}
-	if $skipped {
-		my Str:D $files = $skipped == 1 ?? 'file that is not' !! 'files that are not';
-		@notices.push: "[skipped $skipped $files UTF-8 text]";
 	}
 
 	return ("No matches for '$pattern' under '$rel'", |@notices).join("\n") unless @out.elems;
@@ -786,7 +850,7 @@ method !map-repo(Str:D $rel, Str:D $query, Str:D $focus, Int:D $max-chars --> St
 			# edit that landed inside one filesystem timestamp tick, so the
 			# size has to match too.
 			my Str:D $key = $entry.absolute;
-			my $mtime = (try $entry.modified) // Instant;
+			my $mtime = (try file-mtime($entry)) // Instant;
 			my $cached = %!map-cache{$key};
 			my Str:D $path = (|@base, |%file<parts>).join('/');
 			if $cached.defined && $cached<tags>.defined
@@ -889,7 +953,7 @@ method !stat-path(Str:D $rel --> Str:D) {
 	my $path = self!resolve($rel);
 	die "Path not found: '$rel'" unless $path.e;
 
-	my $modified = try $path.modified;
+	my $modified = try file-mtime($path);
 	(
 		'path: '     ~ (relative-parts($!root, $path).join('/') || '.'),
 		'type: '     ~ ($path.d ?? 'directory' !! $path.f ?? 'file' !! 'other'),
@@ -918,16 +982,51 @@ method !make-dir(Str:D $rel --> Str:D) {
 
 # Segments Windows resolves to devices no matter which directory they appear
 # in — writing root/NUL would leave the sandbox there.  Refused on every
-# platform so behaviour (and the test suite) is identical everywhere.
+# platform so behaviour (and the test suite) is identical everywhere.  COM and
+# LPT take any digit, the superscripts ¹ ² ³ included (Windows reads those as
+# 1, 2 and 3), and the name is compared as Windows compares it: what comes
+# before the first dot, trailing spaces dropped, so 'NUL .txt' is NUL too.
 my constant RESERVED-SEGMENTS = set flat
-	<con prn aux nul>,
-	(1 .. 9).map({ "com$_" }),
-	(1 .. 9).map({ "lpt$_" });
+	<con prn aux nul conin$ conout$>,
+	(|(0 .. 9), '¹', '²', '³').map({ "com$_", "lpt$_" });
+
+#|( Internal: why Windows would open some other name than the segment says,
+    or an undefined Str when it would open exactly that name.  On Windows a
+    relative path's segments must not:
+
+    =item contain a C<:> — C<x:stream> is a data stream of C<x>, and
+          C<j::$INDEX_ALLOCATION> is the directory C<j> itself, whatever kind
+          of link it is;
+    =item end in a dot or a space — Win32 drops them, so C<secret.> IS
+          C<secret>;
+    =item look like an 8.3 short name — a base of up to eight characters
+          holding a C<~> and a letter or digit, and at most a three-letter
+          extension (C<SECRET~1>, C<PROGRA~1.TXT>, a Samba server's
+          C<SECRE~A1>).  Windows still opens a file by the short name it
+          gave it, so a client-side rule about C<secret> could be walked past
+          by C<SECRET~1>; the long name always works.
+
+    Pure string work, so the rule is tested on every host.  Exposed with
+    C<our> scope for the containment tests — not part of the public API. )
+our sub windows-segment-hazard(Str:D $segment --> Str) {
+	return "it contains ':', which names a data stream on Windows"
+		if $segment.contains(':');
+	return 'it ends in a dot or a space, which Windows drops'
+		if $segment ~~ / <[.\x20]> $ /;
+	return "it has the shape of an 8.3 short name, which Windows may resolve to a "
+		~ "different long name: use the file's full name"
+		if $segment ~~ / ^ $<base>=[<-[.]> ** 1..8] [ '.' <-[.]> ** 1..3 ]? $ /
+		&& ~$<base> ~~ / '~' <[A..Za..z0..9]> /;
+	Str;
+}
 
 #| Turn a client-supplied relative path into an IO::Path under $.root, or die.
 #| Three layers, deliberately redundant: textual rejection of anything that
 #| could be absolute, a ban on ".." segments, and a physical-path check that
 #| chases every symlink itself and catches links pointing out of the sandbox.
+#| On Windows a fourth: a segment Windows would read as some other name (see
+#| windows-segment-hazard) is refused, so the name a client's permission rules
+#| judged is the name the OS opens.
 method !resolve(Str:D $rel --> IO::Path:D) {
 	die 'Path must not be empty' if $rel eq '';
 	die "Path must not contain a null byte: '$rel'" if $rel.contains("\0");
@@ -941,7 +1040,14 @@ method !resolve(Str:D $rel --> IO::Path:D) {
 	die "Path may not contain '..' segments: '$rel'"
 		if @parts.first(* eq '..').defined;
 	die "Path may not use a reserved device name: '$rel'"
-		if @parts.first({ RESERVED-SEGMENTS{.split('.').head.lc} }).defined;
+		if @parts.first({ RESERVED-SEGMENTS{.split('.').head.trim-trailing.lc} }).defined;
+	if $*DISTRO.is-win {
+		for @parts -> $part {
+			with windows-segment-hazard($part) -> $why {
+				die "Path segment '$part' is refused on Windows, because $why: '$rel'";
+			}
+		}
+	}
 
 	# Added one segment at a time so no separator spelling reaches IO::Spec.
 	my $candidate = $!root;
@@ -962,14 +1068,25 @@ method !resolve(Str:D $rel --> IO::Path:D) {
 }
 
 #|( The physical path: every symlink chased to its destination, component by
-    component, the way realpath does it.  Exists because IO::Path.resolve is
-    documented not to follow symlinks on Windows, and a containment check is
-    only as good as the resolution it checks.  Fails closed: dies when a link
-    target cannot be read, when a chain exceeds :max-hops (a cycle, in
-    practice), or when a Windows link uses a drive-relative target.  Exposed
-    with `our` scope for the containment tests — not part of the public API. )
+    component, so the answer is the place the operating system will actually
+    open.  Exists because IO::Path.resolve does not follow links on Windows
+    (and mis-joins a junction's absolute target onto its parent when it
+    tries), and a containment check is only as good as the resolution it
+    checks.  One code path on every platform, with each platform's own rule
+    for '..': on POSIX it is physical — the parent of wherever the walk has
+    really got to, the way realpath does it; on Windows it is by NAME — Win32
+    collapses '..' out of a path before the filesystem sees it, and a relative
+    link target is joined onto the link's directory and collapsed the same way
+    before anything inside it is followed.  Junctions and directory symlinks
+    are links here like any other.  Fails closed: dies when a link target
+    cannot be read, when a chain exceeds :max-hops (a cycle, in practice), and
+    on Windows when a link target is drive-relative ('C:foo') or a device path
+    ('\\?\…', '\\.\…'), or when a path segment is made of dots and spaces
+    but is not '.' or '..'.  Public: see "Resolving a path the way the OS
+    will" in the README. )
 our sub physical-path(IO::Path:D $path, Int:D :$max-hops = 40 --> IO::Path:D) {
 	my ($volume, @todo) = split-absolute($path.absolute);
+	@todo = collapse-dots(@todo, $path.absolute) if $*DISTRO.is-win;
 	my Str @out;
 	my Int $hops = 0;
 
@@ -977,8 +1094,9 @@ our sub physical-path(IO::Path:D $path, Int:D :$max-hops = 40 --> IO::Path:D) {
 		my Str $part = @todo.shift.Str;
 		next if $part eq '' || $part eq '.';
 		if $part eq '..' {
-			# The chased prefix is link-free, so popping a component is what
-			# the filesystem itself would do — this is what makes a link to
+			# POSIX only (Windows collapsed every '..' by name before the
+			# walk).  The chased prefix is link-free, so popping a component
+			# is what the kernel itself does — this is what makes a link to
 			# 'a/../b' land where the OS would land it.
 			@out.pop if @out;
 			next;
@@ -998,23 +1116,12 @@ our sub physical-path(IO::Path:D $path, Int:D :$max-hops = 40 --> IO::Path:D) {
 			without $target;
 
 		if $*DISTRO.is-win {
-			# Windows link targets can restart the walk at a new volume (UNC
-			# or drive-rooted), at the current volume's root (separator-
-			# rooted), or continue relative to the link's directory.  A
-			# drive-relative target ('C:foo') depends on a per-drive working
-			# directory this process does not track: refuse it.
-			if $target ~~ /^ [ '\\\\' | '//' ] /
-			|| $target ~~ /^ <[A..Za..z]> ':' <[\/\\]> / {
-				my ($v, @tc) = split-absolute($target);
-				$volume = $v;
-				@out = ();
-				@todo.prepend: @tc;
-				next;
-			}
-			die "Symlink at '$cur' has a drive-relative target '$target' — refusing"
-				if $target ~~ /^ <[A..Za..z]> ':' /;
-			@out = () if $target ~~ /^ <[\/\\]> /;
-			@todo.prepend: $target.split(/<[\/\\]>+/).grep(*.chars);
+			# The chased prefix is the link's directory as the OS now names
+			# it: every earlier link in the path has already been replaced by
+			# its target.  Start the walk again on what Windows opens next.
+			($volume, @todo) = windows-reparse($volume, @out, $target, @todo,
+				link => $cur.Str);
+			@out = ();
 			next;
 		}
 
@@ -1027,28 +1134,80 @@ our sub physical-path(IO::Path:D $path, Int:D :$max-hops = 40 --> IO::Path:D) {
 	join-parts($volume, @out);
 }
 
+#|( Internal: the path Windows opens next when a walk reaches a link, as
+    (volume, components...).  @prefix is the link's directory, @rest is what
+    followed the link in the path being opened.  An absolute target (drive-
+    rooted or UNC) replaces the volume and the prefix; a separator-rooted one
+    ('\x') keeps the volume and drops the prefix; anything else is joined onto
+    the prefix.  Either way the result is collapsed by name, as Win32 does,
+    before any of it is followed: a target of 'L\..\..\x' climbs two levels
+    from the link's directory whatever L points at.  Pure string work, so it
+    is tested on every host.  Exposed with `our` scope for the containment
+    tests — not part of the public API. )
+our sub windows-reparse(Str:D $volume, @prefix, Str:D $target, @rest,
+                        Str:D :$link = '?' --> List:D) {
+	die "Symlink at '$link' has a device-path target '$target' — refusing"
+		if $target ~~ /^ <[\/\\]> ** 2 <[?.]> [ <[\/\\]> | $ ] /;
+	if $target ~~ /^ [ '\\\\' | '//' ] /
+	|| $target ~~ /^ <[A..Za..z]> ':' <[\/\\]> / {
+		my ($v, @tc) = split-windows($target);
+		return ($v, |collapse-dots((|@tc, |@rest), $target));
+	}
+	# A drive-relative target ('C:foo') depends on a per-drive working
+	# directory this process does not track.
+	die "Symlink at '$link' has a drive-relative target '$target' — refusing"
+		if $target ~~ /^ <[A..Za..z]> ':' /;
+	my @base = $target ~~ /^ <[\/\\]> / ?? () !! @prefix;
+	($volume, |collapse-dots((|@base, |$target.split(/<[\/\\]>+/), |@rest), $target));
+}
+
+# Components with '.' and '..' resolved by name, the way Win32 normalises a
+# path: '..' removes the component before it and stops at the volume root
+# (C:\..\x is C:\x; a UNC share is a root too).  Win32 also trims trailing
+# dots and spaces from a name, and what it makes of a segment such as '.. '
+# or '. .' is not something to bet a containment check on: refuse those.
+my sub collapse-dots(@parts, Str:D $whole --> List:D) {
+	my Str @out;
+	for @parts -> $p {
+		next if $p eq '' || $p eq '.';
+		if $p eq '..' {
+			@out.pop if @out;
+			next;
+		}
+		die "Path '$whole' has a segment of dots and spaces ('$p') that Windows "
+			~ "would rename on the way in — refusing"
+			if $p ~~ /^ <[.\x20]>+ $/;
+		@out.push: $p.Str;
+	}
+	@out.List;
+}
+
 # A path split into (volume, components...): '' and ('a','b') for '/a/b';
 # 'C:' and ('a','b') for 'C:\a\b'; '//srv/share' and ('x') for a UNC path.
 # Only Windows treats '\' as a separator or recognises volumes — on POSIX
-# both are legal filename characters.  The drive letter is upcased so the
-# same volume always spells the same way in comparisons.
+# both are legal filename characters.
 my sub split-absolute(Str:D $abs) {
-	if $*DISTRO.is-win {
-		if $abs ~~ /^ [ '\\\\' | '//' ] / {
-			my @comps = $abs.split(/<[\/\\]>+/).grep(*.chars);
-			die "Cannot resolve a UNC path with no share name: '$abs'"
-				unless @comps.elems >= 2;
-			my Str $volume = '//' ~ @comps.shift ~ '/' ~ @comps.shift;
-			return ($volume, |@comps);
-		}
-		my @comps = $abs.split(/<[\/\\]>+/);
-		my Str $volume = '';
-		if @comps && @comps.head ~~ /^ <[A..Za..z]> ':' $/ {
-			$volume = @comps.shift.uc;
-		}
-		return ($volume, |@comps.grep(*.chars));
-	}
+	return split-windows($abs) if $*DISTRO.is-win;
 	('', |$abs.split('/').grep(*.chars));
+}
+
+# The Windows half of split-absolute, callable on any host so the reparse
+# arithmetic above can be tested everywhere.  The drive letter is upcased
+# so the same volume always spells the same way in comparisons.
+my sub split-windows(Str:D $abs) {
+	if $abs ~~ /^ [ '\\\\' | '//' ] / {
+		my @comps = $abs.split(/<[\/\\]>+/).grep(*.chars);
+		die "Cannot resolve a UNC path with no share name: '$abs'"
+			unless @comps.elems >= 2;
+		my Str $volume = '//' ~ @comps.shift ~ '/' ~ @comps.shift;
+		return ($volume, |@comps);
+	}
+	my @comps = $abs.split(/<[\/\\]>+/);
+	my Str $volume = '';
+	if @comps && @comps.head ~~ /^ <[A..Za..z]> ':' $/ {
+		$volume = @comps.shift.uc;
+	}
+	($volume, |@comps.grep(*.chars));
 }
 
 # The inverse: a volume plus components back into an IO::Path, always
@@ -1086,6 +1245,16 @@ my sub path-key(IO::Path:D $p --> Str:D) {
 
 #| Path segments of $path relative to $root.  Callers join with '/' so tool
 #| output reads the same on every platform.
+# When the file was last written. Not IO::Path.modified: on 64-bit Windows
+# MoarVM wraps its nanosecond timestamp at 32 bits, so every file lands
+# within about two seconds of 1970, and elsewhere it is 37 seconds early
+# (the leap seconds are never added). The floating-point stat time is right
+# on every platform. Throws for a missing file, as .modified does.
+my sub file-mtime(IO::Path:D $path --> Instant:D) {
+	Instant.from-posix(nqp::stat_time(nqp::unbox_s($path.absolute),
+		nqp::const::STAT_MODIFYTIME))
+}
+
 my sub relative-parts(IO::Path:D $root, IO::Path:D $path --> List) {
 	my @parts;
 	my $p = $path;
@@ -1332,4 +1501,439 @@ my sub check-io(Mu $result, Str:D $what) {
 	my $exception = $result.exception;
 	$result.so;   # mark handled so it cannot resurface when it is discarded
 	die "$what: {error-line($exception)}";
+}
+
+# === External searchers ===
+
+# Why grep shells out for its candidate list.
+#
+# A recursive Raku scan — walk, slurp, decode, split, search, repeat — is the
+# heaviest thing in this pack by allocation volume, and several of them at once
+# reliably tripped a garbage-collector fault in MoarVM 2026.07 that killed the
+# whole process ("Heap corruption detected: pointer ... to past fromspace").
+# Nothing at the Raku level can catch that: the VM prints one line and calls
+# exit().  Two independent measures fixed it at six concurrent searches, and
+# this pack takes both.
+#
+#   * The scan is SERIALISED.  One process-wide lock — not a per-instance one,
+#     because the fault is in the VM and does not care how many toolkits there
+#     are — wraps the whole walk-and-read phase of every search, on every tier.
+#     It is the only thing that makes the Raku tier safe.
+#
+#   * An external tool PICKS THE CANDIDATES.  When rg or a system grep is
+#     available, it is asked which files contain the pattern, and the Raku scan
+#     then only opens those.  The list arrives in one read of a pipe instead of
+#     a tree's worth of decoded text, which is the allocation the collector was
+#     choking on.
+#
+# What the external tool does NOT do is produce any of the answer.  Every byte
+# the model sees is still formatted by the scan above, from files the scan
+# itself opened, in the order the scan's own walk yields — so the tiers cannot
+# drift apart in formatting, because there is only one formatter.  The
+# candidate list is used as a FILTER over the ordinary walk and never as a
+# source of paths or of order: an external searcher's idea of sorted ("a/b"
+# before "a.txt") is not the walk's ("a" before "a.txt", then descend).
+#
+# The call to the external tool deliberately happens OUTSIDE the scan lock, so
+# those stay parallel — that is the whole point of paying for a process.
+#
+# Three searches are never handed out, because an external tool would answer
+# them differently:
+#
+#   * A REGEX search.  The pattern is a Raku regex, and it is only safe because
+#     Rakudo refuses to interpolate one containing a code block (see the
+#     comment above !grep-files).  Ripgrep would read it as Rust regex syntax
+#     and system grep as POSIX — silently, and with different matches.
+#
+#   * A pattern that is not printable ASCII.  Raku decodes a file to NFG text
+#     before searching it, so a composed "é" in the pattern matches a
+#     decomposed one in the file; a byte-oriented searcher would miss it and
+#     the tiers would disagree.  The reverse direction is harmless — an
+#     external tool naming a file the scan then finds nothing in costs one
+#     open().
+#
+#   * A search of a single FILE rather than a directory.  There is one
+#     candidate; choosing it externally would be pure overhead.
+
+my constant GREP-BACKEND-ENV = 'MCP_FS_GREP_BACKEND';
+
+#| The searchers this pack knows how to drive, and the environment variable
+#| that says which binary each one spawns.  The override exists for the parity
+#| tests — which must be able to pin a tier to a binary they control — and for
+#| the host whose ripgrep is installed under another name.
+my constant SEARCHERS = Map.new((
+	ripgrep => Map.new((binary => 'rg',   env => 'MCP_FS_GREP_RG_BINARY')),
+	grep    => Map.new((binary => 'grep', env => 'MCP_FS_GREP_GREP_BINARY')),
+));
+
+#| Tried in this order.  Ripgrep first: it is the faster of the two and the one
+#| whose flags mean the same thing on every platform it runs on.
+my constant SEARCHER-ORDER = <ripgrep grep>;
+
+# How many answers in a row that cannot be believed a searcher may give
+# before it is dropped for the life of the process, as a probe that said no
+# would have dropped it.  One untrusted answer costs only its own search a
+# full scan, because one is as likely to be the moment (an OOM-killed child,
+# an unlucky list) as the tool; five in a row, with not one believed answer
+# between them, is the tool, and hundreds of searches would each pay a spawn
+# for nothing.  Five rather than two or three because a searcher killed now
+# and then under memory pressure must not be lost to a short bad patch;
+# small, because each refusal costs a spawn and a full scan.  A believed
+# answer starts the count again from nothing, and a launch that failed while
+# the binary was there never counts at all.
+my constant SEARCHER-UNTRUSTED-LIMIT = 5;
+
+# Everything learned about the searchers, keyed by tool and binary, and kept
+# for the life of the process unless reset-searchers clears it: the probe
+# verdicts (see searcher-usable for why they are never revisited, and for the
+# one outcome that is not a verdict and so is never kept), into which a search
+# that finds a searcher's binary gone, or that brings its untrusted answers to
+# SEARCHER-UNTRUSTED-LIMIT in a row, records the same "no"; and the count of
+# those untrusted answers.  All of it behind one lock.
+my $searcher-lock = Lock.new;
+my %searcher-usable;
+my %searcher-untrusted;
+my Int $searcher-spawns = 0;
+my Int $searcher-believed = 0;
+
+#| Which tier the next literal C<grep> of a directory would use: C<'ripgrep'>,
+#| C<'grep'>, or C<'raku'> when no external searcher is usable.  Probes on the
+#| first call.  Exposed with `our` scope for the parity tests — not part of the
+#| public API.
+our sub grep-backend(--> Str:D) { chosen-searcher() || 'raku' }
+
+#| How many external searcher processes this pack has spawned since it was
+#| loaded, probes included.  The parity tests assert on it: it is the only way
+#| to tell "the external tier answered" from "the external tier quietly fell
+#| back and the answers matched because both came from Raku".  Exposed with
+#| `our` scope for those tests — not part of the public API.
+our sub grep-backend-spawns(--> Int:D) {
+	$searcher-lock.protect: { $searcher-spawns }
+}
+
+#| How many of those spawns gave a candidate list this pack believed and used.
+#| The spawn count alone cannot say: a searcher whose answer is not believed
+#| costs that search a full scan and nothing else, so its search answers
+#| exactly as the external tier would have.  Exposed with `our` scope for the
+#| parity tests — not part of the public API.
+our sub grep-backend-believed(--> Int:D) {
+	$searcher-lock.protect: { $searcher-believed }
+}
+
+#|( Forget everything this pack has learned about the external searchers:
+    every probe verdict, the "yes" and the "no" alike; every searcher dropped
+    because its binary went missing or because its answers could not be
+    believed SEARCHER-UNTRUSTED-LIMIT times in a row; and every count of those
+    answers.  The next search that could hand its candidates out probes for a
+    searcher again, from scratch, so a ripgrep installed since the first
+    search is found, and one dropped in error is given its chance back.
+    Process-wide, like the state it clears, which every pack instance in the
+    process shares.  Safe to call while searches are running: the state is
+    cleared under the lock every search takes, and a search already under way
+    finishes on what it had.  Safe to call again: clearing nothing changes
+    nothing.  It does not touch C<MCP_FS_GREP_BACKEND>, which is read on every
+    search anyway.  Public: see "Re-checking the searchers" in the README. )
+our sub reset-searchers(--> Nil) {
+	$searcher-lock.protect: {
+		%searcher-usable    = ();
+		%searcher-untrusted = ();
+	}
+}
+
+#| The first usable searcher, or '' for none.  The backend environment variable
+#| pins the choice: 'ripgrep' or 'grep' to insist on one, 'raku' to insist on
+#| none, 'auto' (the default) to try each in turn.  Read on every call rather
+#| than cached, so a test can move a search from one tier to the next; the
+#| probe behind it is what is expensive, and that is cached.
+my sub chosen-searcher(--> Str:D) {
+	searcher-order-for(%*ENV{GREP-BACKEND-ENV}).first({ searcher-usable($_) }) // '';
+}
+
+my sub searcher-order-for($setting --> List) {
+	my Str:D $forced = ($setting // 'auto').Str.trim.lc;
+	return SEARCHER-ORDER.List if $forced eq 'auto' || $forced eq '';
+	return ('ripgrep',)        if $forced eq 'ripgrep' || $forced eq 'rg';
+	return ('grep',)           if $forced eq 'grep';
+	return ()                  if $forced eq 'raku' || $forced eq 'none';
+	die "{GREP-BACKEND-ENV} must be one of auto, ripgrep, grep or raku, not '$forced'";
+}
+
+#| Has this searcher answered a C<--version>?  Asked once per binary and
+#| remembered — including the "no" — because the common case for a missing tool
+#| is that it will still be missing on the next call, and paying a failed spawn
+#| per search would cost more than the tier saves.  A tool installed while the
+#| server is running is therefore picked up at the next start, or after
+#| reset-searchers, which is the intended trade.
+#|
+#| The one outcome that is not remembered is no answer at all: a binary that is
+#| there but could not be launched, or one killed by a signal before it could
+#| reply.  That is the moment failing — a process out of file descriptors, a
+#| system out of processes, a binary being rewritten by an upgrade — and
+#| keeping it would lose the tier for the life of the process over one bad
+#| second.  So this call goes without the searcher and the next one asks again.
+my sub searcher-usable(Str:D $tool --> Bool:D) {
+	my Str:D $key = searcher-key($tool);
+	$searcher-lock.protect: {
+		if %searcher-usable{$key}:exists {
+			%searcher-usable{$key};
+		} else {
+			my Bool $verdict = probe-searcher($tool);
+			%searcher-usable{$key} = $verdict if $verdict.defined;
+			$verdict // False;
+		}
+	}
+}
+
+#| Record that a searcher's binary is not there, as its probe would have: from
+#| now on, until reset-searchers, it is not used and not spawned.
+my sub drop-searcher(Str:D $tool --> Nil) {
+	my Str:D $key = searcher-key($tool);
+	$searcher-lock.protect: { %searcher-usable{$key} = False };
+}
+
+#| Count one answer from $tool that could not be believed, and drop the
+#| searcher, as drop-searcher would, when that makes SEARCHER-UNTRUSTED-LIMIT
+#| in a row.  Under the lock, so concurrent searches cannot lose a count or
+#| drop it twice.
+my sub count-untrusted(Str:D $tool --> Nil) {
+	my Str:D $key = searcher-key($tool);
+	$searcher-lock.protect: {
+		%searcher-usable{$key} = False
+			if ++%searcher-untrusted{$key} >= SEARCHER-UNTRUSTED-LIMIT;
+	}
+}
+
+#| Count one believed answer from $tool: whatever run of untrusted answers it
+#| had given is over.
+my sub count-believed(Str:D $tool --> Nil) {
+	my Str:D $key = searcher-key($tool);
+	$searcher-lock.protect: {
+		%searcher-untrusted{$key}:delete;
+		$searcher-believed++;
+	}
+}
+
+my sub searcher-key(Str:D $tool --> Str:D) { $tool ~ "\t" ~ searcher-binary($tool) }
+
+my sub searcher-binary(Str:D $tool --> Str:D) {
+	my $override = %*ENV{SEARCHERS{$tool}<env>};
+	$override.defined && $override.Str.chars ?? $override.Str !! SEARCHERS{$tool}<binary>;
+}
+
+#| The probe: True when the searcher printed a version and exited 0; False when
+#| it ran and did anything else, or when its binary is not there at all; and an
+#| undefined Bool, which is no verdict, when it could not be launched although
+#| its binary is there, or was killed by a signal.
+my sub probe-searcher(Str:D $tool --> Bool) {
+	my $run = spawn-searcher($tool, ('--version',));
+	without $run {
+		# run() reports "no such program" and "no descriptor left to start it
+		# with" identically, as an exit code of -1.  Whether the binary is
+		# there is what tells them apart.
+		return searcher-findable(searcher-binary($tool)) ?? Bool !! False;
+	}
+	return Bool if $run<signal> != 0;
+	so $run<exit> == 0 && $run<out>.elems;
+}
+
+#| Whether a spawn could have found $binary: the test that tells a searcher
+#| that is not installed (a verdict, worth remembering) from one that is
+#| installed and could not be launched just now (no verdict).  Generous on
+#| purpose, because the two ways of being wrong are not alike: a wrong "yes"
+#| costs a probe on the next call, a wrong "no" loses the tier for the life of
+#| the process.  So it looks everywhere either platform's spawn might — a name
+#| with a directory in it where it says, a bare name in every PATH entry (and,
+#| on Windows, the working directory first), on Windows also with .com and
+#| .exe appended — and accepts anything that exists there.
+my sub searcher-findable(Str:D $binary --> Bool:D) {
+	my Bool:D $windows = $*DISTRO.is-win;
+	my @names = $windows ?? ($binary, $binary ~ '.com', $binary ~ '.exe') !! ($binary,);
+	my Bool:D $placed = $binary.contains('/')
+		|| ($windows && ($binary.contains('\\') || $binary.contains(':')));
+	return @names.first({ .IO.e }).defined if $placed;
+
+	# %*ENV is case-sensitive and Windows names the variable Path.
+	my $key = %*ENV.keys.first({ .uc eq 'PATH' });
+	my Str:D $path = $key.defined ?? %*ENV{$key}.Str !! ($windows ?? '' !! '/usr/bin:/bin');
+	my @dirs = $path.split($windows ?? ';' !! ':').map({ $_ eq '' ?? '.' !! $_ });
+	@dirs.unshift('.') if $windows;
+	@dirs.first(-> $dir { @names.first({ $dir.IO.add($_).e }).defined }).defined;
+}
+
+#| Whether a searcher's run produced an answer that can be believed: one it
+#| was not killed in the middle of, and that exited with a status its own
+#| documentation calls an answer.  ripgrep's man page: 0 when something
+#| matched, 1 when nothing did, 2 when an error occurred.  GNU grep's: the
+#| same three.  BSD grep's, and POSIX's: 0, 1, and above 1 for an error.
+#|
+#| An error exit is believed when nothing was written to stderr.  Both tools
+#| are run with C<--no-messages> / C<-s>, which silence exactly the messages
+#| about files they could not open or read, and every one of them still exits
+#| 2 for it — a root holding one unreadable file would otherwise cost every
+#| search a full scan.  The list such a run prints names every file the tool
+#| could read, and the scan cannot read the rest either, so it is the same
+#| list a clean run would have printed.  An error that is a refusal — an
+#| option it does not know, memory exhausted — is still printed, and is not
+#| believed.  Checked against ripgrep 14.1.1, GNU grep 3.12 and BSD grep
+#| 2.6.0: an unreadable file or directory exits 2 with the readable matches
+#| listed and stderr empty; an unknown option exits 2 with nothing listed and
+#| a message on stderr.  The window this leaves open is a file that opened and
+#| then failed part-way through being read (EIO): that, too, is silenced and
+#| believed, and a scan that could have read it would miss its lines.
+#|
+#| A signal is never believed, whatever the exit code says: Rakudo reports a
+#| killed child as exit code 0, and the list it printed stops wherever it was
+#| killed.
+my sub searcher-answered(Map:D $run --> Bool:D) {
+	return False if $run<signal> != 0;
+	return True  if $run<exit> == 0 || $run<exit> == 1;
+	$run<exit> == 2 && $run<err>.elems == 0;
+}
+
+#| The candidate list for a literal search of $dir: the set of comparison keys
+#| of the files an external searcher says contain $pattern.  An undefined Set
+#| means "no candidate list" — no searcher, one that could not be launched, or
+#| an answer that cannot be believed — and the caller then scans everything,
+#| which is always correct and only slow.
+#|
+#| A searcher that passed its probe and then cannot be launched is looked for
+#| again, exactly as a probe that could not launch it would be.  If its binary
+#| is no longer there it is dropped at once, as if its probe had said no, so
+#| the searches after it go straight to the next tier and spawn nothing.  If
+#| it is still there, what stopped it is the moment (out of file descriptors,
+#| out of processes): the next search tries it again, and the failure is not
+#| held against it.
+#|
+#| A searcher that was launched and gave an answer that cannot be believed
+#| costs that search a full scan, and is dropped only when that has happened
+#| SEARCHER-UNTRUSTED-LIMIT times in a row, because the two ways of being
+#| wrong are not alike: giving up on a searcher over one bad answer — an
+#| OOM-killed child, one unlucky list — would leave a long-running server on
+#| the slow tier for the rest of its life, while keeping one that never
+#| answers properly costs a spawn per search, which a short run of them can
+#| afford and hundreds cannot.
+my sub external-candidates(Str:D $pattern, IO::Path:D $dir --> Set) {
+	my Str:D $tool = chosen-searcher();
+	return Set unless $tool;
+
+	my $run = spawn-searcher($tool, searcher-args($tool, $pattern, $dir.absolute));
+	without $run {
+		drop-searcher($tool) unless searcher-findable(searcher-binary($tool));
+		return Set;
+	}
+	unless searcher-answered($run) {
+		count-untrusted($tool);
+		return Set;
+	}
+
+	my @paths = $run<out>.decode('utf8-c8').lines.grep(*.chars);
+	# We hand the searcher an absolute directory, so every path it names must
+	# come back absolute.  One that does not means we are not driving what we
+	# think we are driving, and a candidate list we cannot align with the walk
+	# would silently hide matches.
+	if @paths.first({ !.IO.is-absolute }).defined {
+		count-untrusted($tool);
+		return Set;
+	}
+	count-believed($tool);
+	@paths.map({ search-key($_) }).Set;
+}
+
+#| The argument list for one candidate query.  Every flag is here to make the
+#| searcher's idea of "which files are worth opening" a SUPERSET of the scan's:
+#| it may name a file the scan then rejects, but it must never stay silent
+#| about one the scan would have matched.
+my sub searcher-args(Str:D $tool, Str:D $pattern, Str:D $dir --> List) {
+	return (
+		'--files-with-matches',   # the list, not the lines: the scan reads the lines
+		'--no-config',            # a user's rg config file must not change what we see
+		'--no-ignore',            # .gitignore is not this pack's filter; the root is
+		'--hidden',               # the walk does not skip dotfiles, so neither may this
+		'--no-follow',            # nor does the walk descend a symlinked directory
+		'--no-messages',          # an unreadable file is the walk's business
+		'--text',                 # and a binary one is the scan's: it must be listed
+		'--fixed-strings',        # literal, always: a regex never reaches this tier
+		'--', $pattern, $dir,
+	) if $tool eq 'ripgrep';
+
+	# The same seven decisions in the flags BSD grep and GNU grep agree on:
+	# -r recurses without following links found on the way, -l lists names,
+	# -F is literal, -a stops binary files being dropped, -s silences the
+	# unreadable ones.  Neither reads a config file, and neither has an
+	# ignore-file notion to turn off.
+	return ('-r', '-l', '-F', '-a', '-s', '--', $pattern, $dir) if $tool eq 'grep';
+
+	();
+}
+
+#| Run a searcher, and say what it did: a Map of its C<exit> code, the
+#| C<signal> that killed it (0 for none), and its C<out> and C<err> bytes.  Nil
+#| when it could not be launched at all.  Never throws: a search that cannot
+#| shell out is a search that scans everything instead.
+#|
+#| C<run> rather than C<Proc::Async> deliberately.  On Rakudo 2026.07 a
+#| C<Proc::Async> whose binary does not exist breaks an unhandled promise on a
+#| scheduler thread and takes the process down with it, C<try> or no C<try>;
+#| C<run> reports the same condition as an exit code of -1, and reports a
+#| spawn refused for want of file descriptors the same way.  stderr is drained
+#| on its own thread because a child that fills its stderr pipe while we are
+#| reading its stdout deadlocks both of us.  And its stdin is B<closed> rather
+#| than inherited: this pack's usual home is a server speaking JSON-RPC over
+#| stdin, and a child that read one byte of that would eat the conversation.
+my sub spawn-searcher(Str:D $tool, @arguments --> Map) {
+	$searcher-lock.protect: { $searcher-spawns++ };
+
+	my $proc = try run(
+		searcher-binary($tool), |@arguments,
+		:in(False), :out, :err, :bin, :env(searcher-env()),
+	);
+	return Nil without $proc;
+
+	my $draining = start { (try $proc.err.slurp(:close)) // Buf.new };
+	my $out      = (try $proc.out.slurp(:close)) // Buf.new;
+	my $err      = await $draining;
+
+	my $exit = try $proc.exitcode;
+	return Nil unless $exit.defined && $exit >= 0;
+	my $signal = (try $proc.signal) // 0;
+	Map.new((exit => $exit, signal => $signal, out => $out, err => $err));
+}
+
+#| The environment a searcher runs in: ours, minus everything that could talk
+#| it into searching differently, plus the C locale so a literal search is a
+#| byte search whatever the host is set to.
+my sub searcher-env(--> Hash) {
+	my %env = %*ENV;
+	%env<GREP_OPTIONS GREP_COLOR GREP_COLORS RIPGREP_CONFIG_PATH>:delete;
+	%env<LC_ALL> = 'C';
+	%env;
+}
+
+#| True when a literal pattern means the same thing to an external searcher as
+#| it does to the Raku scan: printable ASCII, plus tab.  Anything else — a
+#| composed character that normalisation could move, a newline that a searcher
+#| would read as a second pattern, a NUL that C<argv> cannot carry — goes to
+#| the Raku tier instead of to a guess.
+my sub externally-searchable(Str:D $pattern --> Bool:D) {
+	!$pattern.ords.first({ $_ != 0x09 && ($_ < 0x20 || $_ > 0x7E) }).defined;
+}
+
+#| True when an external searcher's silence about a file cannot be believed,
+#| whatever it said about the rest of the tree, so the scan must open it.  Two
+#| kinds: a symlink, which neither ripgrep nor either grep follows when it
+#| finds one during a traversal, while this pack's scan reads one whose target
+#| is inside the root; and a name carrying a line break, which cannot be found
+#| in a list that arrives one path per line.
+my sub unreportable-file(IO::Path:D $file --> Bool:D) {
+	return True if $file.l;
+	my Str:D $absolute = $file.absolute;
+	$absolute.contains("\n") || $absolute.contains("\r");
+}
+
+#| The spelling a path is compared by when matching a searcher's output against
+#| the walk's: repeated and trailing separators collapsed, Windows separators
+#| and drive letter unified, so C<//srv//x> and C</srv/x> are one file.
+my sub search-key(Str:D $absolute --> Str:D) {
+	my ($volume, @parts) = split-absolute($absolute);
+	path-key(join-parts($volume, @parts));
 }

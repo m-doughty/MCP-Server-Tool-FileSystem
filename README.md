@@ -97,6 +97,8 @@ Tools
 
 Names below are unprefixed. With the default prefix they are `fs_read`, `fs_write` and so on.
 
+The headings below are the whole signature, and the published JSON Schema says the same thing: a parameter with no `=` in its heading is in the schema's `required` array, and a parameter shown as `path = '.'` carries that value as its JSON Schema `default`. Both matter more than they look. A schema that marked nothing required would tell a model that `read` may be called with no `path` — and a model that believes it (they do) spends its call on an error instead of an answer. A schema that hid the defaults would leave a model unable to tell `grep` without a `path` (the whole root) from `grep` with one.
+
 ### Parameter naming
 
 Parameter names in this pack are a contract, not a matter of taste:
@@ -117,7 +119,7 @@ That is not decoration. A host reads it as a licence to run a batch of those cal
 
   * `map` takes the map cache's own lock around the whole map, so two maps of one tree cannot tear the per-file parse cache between them.
 
-  * `glob` and `grep` touch no instance state at all.
+  * `glob` touches no instance state at all, and `grep` touches none either — but its scanning phase runs under one **process-wide** lock, so two searches never read files at the same time however many packs there are. That is a VM-level requirement rather than a coherence one, and [How grep searches](#how-grep-searches) says why.
 
 Several reads on **one** pack instance therefore see coherent state. What the annotations do **not** promise is anything about the filesystem underneath: a read running beside another process's write is a race the pack never had a say in, exactly as it always was.
 
@@ -263,7 +265,7 @@ The rest of the parameters bound what comes back:
 
   * `max-results` (1 to 1000, default 50) stops the search after that many *matching* lines and says so. Files are visited in sorted order, so a truncated result is the same result every time.
 
-  * Files that are not UTF-8 text — a NUL byte in the first 8KB, or bytes that will not decode — are skipped, and a trailing notice counts them.
+  * Files that are not UTF-8 text — a NUL byte in the first 8KB, or bytes that will not decode — are skipped in silence. Nothing counts them; [How grep searches](#how-grep-searches) says why that notice was removed.
 
     { "name": "fs_grep", "arguments": { "pattern": "yak", "context": 1 } }
     => "notes/todo.md-3-shopping:
@@ -279,7 +281,126 @@ The rest of the parameters bound what comes back:
 
         [stopped at 2 matching lines; raise max-results to see more]"
 
-`grep` is a reading tool: it is registered even when `read-only` is set.
+`grep` is a reading tool: it is registered even when `read-only` is set. *How* it searches — and why it would rather have ripgrep pick the files it opens — is [How grep searches](#how-grep-searches), below.
+
+### How grep searches
+
+`grep` runs its own scan over its own walk and formats every byte of its own answer. What it will hand to an outside tool — and only when there is one — is the question *which files are worth opening at all*:
+
+  * **ripgrep**, if `rg` is on the PATH.
+
+  * **a system `grep`**, if that is there and `rg` is not.
+
+  * **nothing**, on a host with neither (a stock Windows, most minimal containers). The scan then opens every file below the path, exactly as this pack always did.
+
+The three tiers return **the same bytes**. They have to: the external tool never produces a line of the answer, never decides the order, and never sees the `glob`, the `context` or the `max-results`. It answers one question, its answer is used as a **filter** over the ordinary walk, and everything the model reads is then produced by the same scanner it always was. `t/07-grep-parity.rakutest` runs every query through every tier installed on the machine and compares the results as strings.
+
+#### Why
+
+A recursive Raku scan — walk, slurp, decode, split, search — is the heaviest thing in this pack by allocation volume, and several at once reliably tripped a garbage-collector fault in MoarVM 2026.07 that killed the whole process:
+
+```text
+MoarVM panic: Heap corruption detected: pointer 0x... to past fromspace
+```
+
+Nothing at the Raku level can catch that — the VM prints one line and calls `exit()`, so no `END` block, no `LEAVE`, no signal handler runs. It is a VM bug rather than this pack's, but a search tool that takes the server down when a model asks two questions at once is this pack's problem. Two measures fixed it at six concurrent searches, and both are in:
+
+  * The scanning phase runs under **one process-wide lock**. Process-wide and not per-instance, because the fault is in the collector and does not care how many toolkits there are.
+
+  * When an external searcher is available, the scan only opens the files it named — usually a handful instead of a tree — so the allocation the collector was choking on never happens. The call to the searcher is made **outside** the lock, so those still run in parallel.
+
+#### What is asked, exactly
+
+```shell
+rg --files-with-matches --no-config --no-ignore --hidden --no-follow \
+   --no-messages --text --fixed-strings -- <pattern> <absolute directory>
+
+grep -r -l -F -a -s -- <pattern> <absolute directory>
+```
+
+Every flag is there to make the searcher's idea of "worth opening" a **superset** of the scan's. `--no-ignore` because a `.gitignore` is not this pack's filter (the root is); `--hidden` because the walk does not skip dotfiles; `--no-follow` because it does not descend symlinked directories; `--text` and `-a` because a binary file must still be listed — dropping it is the **scan's** decision, taken on the same NUL sniff as always; `--no-config` because a user's `rg` configuration file must not be able to change what a tool call returns. The searcher runs with `LC_ALL=C` and without `GREP_OPTIONS`, `GREP_COLORS` or `RIPGREP_CONFIG_PATH`.
+
+The `glob` parameter is deliberately **not** passed on: its dialect is this pack's, not ripgrep's, and the scan applies it. Neither searcher's own file list is used for paths or for order, either — their idea of sorted (`a/b` before `a.txt`) is not the walk's (`a` before `a.txt`, then descend).
+
+Two kinds of file are opened whatever the searcher said about them, because its silence cannot mean anything: a **symlink** (no searcher follows one it meets during a traversal, while this pack reads one whose target is inside the root) and a name carrying a **line break** (which cannot be found in a list that arrives one path per line).
+
+#### What never leaves Raku
+
+  * A **regex** search. The pattern is a *Raku* regex, and it is only safe because Rakudo refuses to interpolate one containing a code block — see [Regex interpolation](#regex-interpolation). Ripgrep would read it as Rust regex syntax and a system grep as POSIX: silently, and with different matches.
+
+  * A pattern that is not **printable ASCII**. Raku decodes a file to NFG text before searching it, so a composed `é` in the pattern matches a decomposed one in the file; a byte-oriented searcher would not, and the tiers would disagree.
+
+  * A search of a single **file** rather than a directory. There is one candidate and choosing it externally would be pure overhead.
+
+#### The probe, and how long it is remembered
+
+A searcher counts as usable only once it has actually run and answered `--version`. That costs a process spawn, so the verdict is taken **once per binary per process** and never revisited — the "no" as firmly as the "yes", since paying a failed spawn on every search would cost more than the tier saves. "No" means the binary is not there, or that it ran and gave no version: exited non-zero, or printed nothing. A probe that gets **no answer at all** is not a verdict, and is not kept: a binary that is there but could not be launched — the server out of file descriptors, the system out of processes, the binary being rewritten by an upgrade — or one killed by a signal before it replied is asked again on the next call. A searcher that passed its probe and later cannot be launched is looked for the same way: if its binary has gone, it is dropped there and then, as if its probe had said no, and the searches after it spawn nothing; if it is still there, the failure is the moment's, the next search tries again, and it is not held against the searcher.
+
+#### Which answers are believed
+
+After the probe, each search decides whether **its own** answer can be believed. One that cannot costs that search a full scan and not the tier — until a searcher has given **five** in a row with no believed answer between them, which drops it as a failed probe would. One bad answer is as likely to be the moment (an OOM-killed child, an unlucky list) as the tool, and giving a searcher up over it would leave a long-running server slow for the rest of its life; five in a row is the tool, and hundreds of searches should not each pay a spawn and a scan for it. A believed answer starts the count again, and a launch that failed while the binary was there never counts. An answer is believed when the searcher was not killed by a signal and exited with a status its documentation calls an answer. ripgrep's man page gives 0 for a match, 1 for none and 2 for an error; GNU grep's gives the same three; BSD grep's and POSIX's give 0, 1, and anything above 1 for an error. So:
+
+  * **0 or 1** is an answer.
+
+  * **2 with nothing on stderr** is an answer too. This pack runs every searcher with `--no-messages` or `-s`, which silence exactly the complaints about files it could not open or read, and all three tools still exit 2 for one; a root holding a single unreadable file would otherwise cost every search a full scan. The list such a run prints names every file the tool could read, and the scan cannot read the rest either, so it is the list a clean run would have printed.
+
+  * **2 with a message** is a refusal — an option it does not know, memory exhausted — and is not believed.
+
+  * **Anything else** is not believed: any other status, a child killed by a signal (which Rakudo reports as exit code 0, with the list cut short wherever the signal landed), a launch that never happened, output that is not a list of absolute paths.
+
+Measured on ripgrep 14.1.1, GNU grep 3.12 and BSD grep 2.6.0: an unreadable file or directory exits 2 with every readable match listed and stderr empty, and an unknown option exits 2 with nothing listed and a message on stderr.
+
+The consequence worth stating plainly: installing `rg` while a server is running does not speed up that server, only the next one — unless whatever hosts the pack calls `reset-searchers`, below.
+
+#### Overriding it
+
+<table class="pod-table">
+<thead><tr>
+<th>Variable</th> <th>Value</th> <th>Effect</th>
+</tr></thead>
+<tbody>
+<tr> <td>MCP_FS_GREP_BACKEND</td> <td>auto (default)</td> <td>ripgrep if it is there, else a system grep, else the Raku scan</td> </tr> <tr> <td>MCP_FS_GREP_BACKEND</td> <td>ripgrep</td> <td>only ripgrep; the Raku scan when it is unusable</td> </tr> <tr> <td>MCP_FS_GREP_BACKEND</td> <td>grep</td> <td>only a system grep; the Raku scan when it is unusable</td> </tr> <tr> <td>MCP_FS_GREP_BACKEND</td> <td>raku</td> <td>never shell out</td> </tr> <tr> <td>MCP_FS_GREP_RG_BINARY</td> <td>a binary name or path</td> <td>what the ripgrep tier spawns; defaults to rg</td> </tr> <tr> <td>MCP_FS_GREP_GREP_BINARY</td> <td>a binary name or path</td> <td>what the grep tier spawns; defaults to grep</td> </tr>
+</tbody>
+</table>
+
+Any other value of MCP_FS_GREP_BACKEND is an error on the call rather than a silent fallback, so a typo cannot quietly cost a tier.
+
+They exist for the parity tests, which have to pin a search to a tier they choose, and they are read on every call rather than cached. The binary overrides must name the real tool: a searcher that runs happily and prints something **else** cannot be detected, only believed.
+
+#### Re-checking the searchers
+
+Everything the pack learns about the searchers — every probe verdict, the "yes" and the "no" alike, every searcher dropped, every count of answers that could not be believed — lasts for the life of the process. `MCP::Server::Tool::FileSystem::reset-searchers()` forgets all of it, so the next search probes again from scratch: a ripgrep installed since the first search is found, and a searcher dropped in error is given its chance back.
+
+```raku
+our sub reset-searchers(--> Nil)
+```
+
+It is a library function rather than a tool, because whether the host's programs have changed is the host's question, not the model's. It is process-wide, like the state it clears, which every pack instance in the process shares. It is safe to call while searches are running — a search already under way finishes on what it had — and safe to call again, since clearing nothing changes nothing. It leaves `MCP_FS_GREP_BACKEND` alone; that is read on every search anyway.
+
+A harness that serves the pack to a user is the natural caller: bind it to a command, so the user can say "I have just installed ripgrep" without restarting anything.
+
+```raku
+use MCP::Server::Tool::FileSystem;
+
+# One entry in a harness's own command table.
+my %commands = rescan => {
+    MCP::Server::Tool::FileSystem::reset-searchers();
+    'The next search looks for ripgrep and a system grep again.';
+};
+
+# ...and when the user types /rescan:
+say %commands<rescan>();
+```
+
+#### The notice that is gone
+
+`grep` used to end an answer that had skipped unreadable files with
+
+```text
+[skipped 2 files that are not UTF-8 text]
+```
+
+That line has been **removed**. Ripgrep passes a binary file over in silence and cannot be made to count them, so the notice was the one part of the output that could not survive the question "which tier served this call?". Identical answers are worth more than the count was. The other notice — `[stopped at N matching lines; raise max-results to see more]` — is unchanged: every tier reproduces it, because every tier counts the same matched lines.
 
 ### map(path = '.', query?, focus?, max-chars = 8192)
 
@@ -394,11 +515,13 @@ Confinement is the whole point of this pack, so it is done in layers that each h
 
   * **No `..` at all.** `..` segments are refused even when the result would have stayed inside the root (`a/../b` is an error, not a synonym for `b`). One rule is easier to audit than an arithmetic one.
 
-  * **No device names.** Segments Windows resolves to devices regardless of directory — `CON`, `PRN`, `AUX`, `NUL`, `COM1`..`COM9`, `LPT1`..`LPT9`, with or without an extension — are refused on every platform, so behaviour is identical everywhere rather than only safe where it is tested.
+  * **No device names.** Segments Windows resolves to devices regardless of directory — `CON`, `PRN`, `AUX`, `NUL`, `CONIN$`, `CONOUT$`, `COM0`..`COM9`, `LPT0`..`LPT9` and the superscript `COM¹`..`COM³`, `LPT¹`..`LPT³`, with or without an extension and with trailing spaces before it (`NUL .txt` is `NUL`) — are refused on every platform, so behaviour is identical everywhere rather than only safe where it is tested.
+
+  * **On Windows, no name that opens another name.** A segment holding a `:` (`x:stream` is a data stream of `x`, and `link::$INDEX_ALLOCATION` is the directory `link` itself), one ending in a dot or a space (Win32 drops them: `secret.` **is** `secret`), and one shaped like an 8.3 short name (a base of up to eight characters holding a `~` and a letter or digit, at most a three-letter extension: `SECRET~1`, `PROGRA~1.TXT`, a Samba server's `SECRE~A1`) are refused. None of them escapes the root, but each lets the name a permission layer in front of this pack judged differ from the name the OS opens — a rule about `secret` walked past by `SECRET~1`. The file's full name always works. On POSIX all of these are ordinary names.
 
   * **No null bytes.**
 
-  * **Physical-path symlink chase.** The candidate path is built segment by segment under the root; then every symlink in it is chased to its destination — component by component, the way `realpath` works, with a hop budget against cycles — and the *physical* result is checked against the root. A symlink planted inside the sandbox therefore cannot be used as a door out of it, whether it points at a file or a directory, whether directly or through a chain, and whether its target is absolute or relative. The chase is the pack's own (over `readlink`), **not** `IO::Path.resolve`, because `.resolve` does not follow symlinks on Windows — an unfollowed link is an open door the OS walks through at open time even though a check did not. One code path runs on every platform. A link whose target cannot be read, a chain that exceeds the hop budget, and a Windows drive-relative target (`C:foo`) are all refused outright: fail closed.
+  * **Physical-path symlink chase.** The candidate path is built segment by segment under the root; then every symlink in it is chased to its destination — component by component, the way `realpath` works, with a hop budget against cycles — and the *physical* result is checked against the root. A symlink planted inside the sandbox therefore cannot be used as a door out of it, whether it points at a file or a directory, whether directly or through a chain, and whether its target is absolute or relative. The chase is the pack's own (over `readlink`), **not** `IO::Path.resolve`, because `.resolve` does not follow symlinks on Windows — an unfollowed link is an open door the OS walks through at open time even though a check did not. One code path runs on every platform, and it resolves `..` the way *this* platform's OS does: physically on POSIX, by name on Windows (see [Resolving a path the way the OS will](#Resolving a path the way the OS will)). A link whose target cannot be read, a chain that exceeds the hop budget, a Windows drive-relative (`C:foo`) or device-path (`\\?\…`) target, and a Windows segment of dots and spaces other than `.` and `..` are all refused outright: fail closed.
 
   * **Parent-chain containment, not string prefixes.** The final check walks `.parent` from the chased path up to the filesystem root looking for the root itself. `/srv/root2` is not inside `/srv/root`, and no separator-spelling difference can fake a match — on Windows both slash spellings are unified before comparing.
 
@@ -426,7 +549,7 @@ Residual risks worth knowing:
 
   * A symlink already inside the root that points *within* the root is followed, by design. If you populate the sandbox from an untrusted source, populate it without symlinks.
 
-  * On a platform whose `resolve` does not fully canonicalise (older Windows), a pre-planted in-root symlink pointing outside could in principle survive the ancestor check. The `..`/absolute/device rejections still hold; treat the root as a directory you control the contents of.
+  * Windows 8.3 short names (`PROGRA~1`) are not expanded. In a path argument one is refused (see above). In a link target, a short name never matches a root spelt long, or the other way round, so it is refused: a false denial, never an escape. Configure the root the way the OS reports it. A file whose own long name has the short-name shape (`DATA~1.TXT`) cannot be reached by this pack on Windows.
 
   * Confinement is not a permission system. Anything the server process can read under the root, the model can read, and on a read-write pack anything it can write, the model can `delete`. Run it as a user with no more access than you intend to grant, use `read-only` unless writes are actually wanted, and put a permission layer in front of it if "the whole root" is more than you meant to hand over.
 
@@ -436,7 +559,69 @@ Residual risks worth knowing:
 
   * Conditional revisions are authoritative among calls through one toolkit instance. An unrelated process writing the same filesystem does not take this lock, so it can still race between the toolkit's comparison and operating-system mutation. Its completed changes are detected by the next comparison; it does not participate atomically.
 
-  * Nothing here rate-limits or size-limits: `read` will happily slurp a huge file into memory, `glob` will walk a huge tree, and `grep` reads every text file below the path it is given (`max-results` bounds the *output*, not the reading). `map` is the one exception — it prunes, skips files over 1MB, stops after 5000 files and bounds its own output — but its first pass over a large tree still costs a parse of every source file in it. Point the pack at a workspace, not at `/`.
+  * Nothing here rate-limits or size-limits: `read` will happily slurp a huge file into memory, `glob` will walk a huge tree, and `grep` walks the whole tree below the path it is given — opening every text file in it when no external searcher is installed, and only the files one named when there is (`max-results` bounds the *output*, not the walking). `map` is the one exception — it prunes, skips files over 1MB, stops after 5000 files and bounds its own output — but its first pass over a large tree still costs a parse of every source file in it. Point the pack at a workspace, not at `/`.
+
+Resolving a path the way the OS will
+------------------------------------
+
+The resolver behind containment is public, for any code that has to name a directory where the operating system will check it: a sandbox profile that lists the paths a child may write, a lock keyed on a path, a "which root is this under" test of your own.
+
+```raku
+use MCP::Server::Tool::FileSystem;
+
+my &physical = &MCP::Server::Tool::FileSystem::physical-path;
+
+# /srv/current -> releases/42
+say physical('/srv/current/notes.txt'.IO);   # "/srv/releases/42/notes.txt".IO
+
+# C:\Users\me\work is a junction to D:\work
+say physical('C:\Users\me\work\src'.IO);     # "D:/work/src".IO
+
+# Paths that do not exist yet are kept as far as they go.
+say physical('/srv/current/not/yet'.IO);     # "/srv/releases/42/not/yet".IO
+```
+
+`physical-path(IO::Path:D $path, Int:D :$max-hops = 40 --> IO::Path:D)` makes `$path` absolute against `$*CWD`, then walks it one component at a time. Every component that is a link — a symlink anywhere, and on Windows a junction too — is replaced by its target and the walk carries on from there, so a link in the middle of a path is followed just like one at the end. The result is absolute and link-free as far as the path exists. Windows paths come back with an upper-case drive letter; `.absolute` gives the native spelling.
+
+### Why not `IO::Path.resolve`
+
+`.resolve` is the right tool on POSIX and the wrong one on Windows. It does not follow symbolic links there, and when it meets a junction it splices the junction's absolute target onto the junction's parent and returns a path that does not exist. `physical-path` is one implementation on every platform.
+
+### `..` follows the platform's rule
+
+The two families disagree about what `..` means once a link is involved, and the resolver has to agree with the OS it runs on, or a path the check calls inside is one the OS opens outside. Take `one/L/../x.txt`, where `L` is a link to `deep/a/b`:
+
+  * **POSIX** resolves `..` physically: it is the parent of wherever the walk has really got to. `L` takes the walk to `deep/a/b`; `..` is `deep/a`; the answer is `deep/a/x.txt`.
+
+  * **Windows** resolves `..` by name. Win32 collapses it out of the path before the filesystem sees it, so the answer is `one/x.txt` and `L` is never consulted. A link whose target is relative is joined onto the link's directory and collapsed the same way before anything in it is followed: a target of `L\..\..\x` climbs two levels from the link, whatever `L` points at.
+
+`t/10-physical-path.rakutest` reads each such path through the OS and checks that `physical-path` names the file the OS opened.
+
+### Failing closed
+
+`physical-path` dies rather than guess when:
+
+  * a link's target cannot be read;
+
+  * a chain is longer than `:max-hops` (a cycle, in practice);
+
+  * on Windows, a link target is drive-relative (`C:foo`, which depends on a per-drive working directory) or a device path (`\\?\…`, `\\.\…`);
+
+  * on Windows, a segment is made of dots and spaces but is not `.` or `..` (Win32 renames such segments on the way in).
+
+### A containment check with it
+
+Resolve both sides, then compare. Resolving only the candidate means a root reached through a link never matches:
+
+```raku
+my $root = physical($workspace.IO).absolute;
+my $p    = physical($candidate.IO).absolute;
+my $sep  = $*SPEC.dir-sep;
+die "outside the workspace: $candidate"
+    unless $p eq $root || $p.starts-with($root.ends-with($sep) ?? $root !! $root ~ $sep);
+```
+
+The comparison is exact-case, so on a case-insensitive filesystem a mismatch in case denies rather than admits. What a resolver cannot defend against is the filesystem changing after the check: resolve, check and open as close together as you can.
 
 Testing
 -------
@@ -446,7 +631,9 @@ prove6 -Ilib t/           # with MCP::Server installed
 prove6 -Ilib -I../MCP-Server/lib t/    # against a sibling checkout
 ```
 
-`t/03-containment.rakutest` is the file to read first if you change the resolver: it drives every escape attempt through real tool calls, including symlink escapes, and adapts rather than skips on hosts where creating a symlink is not permitted. `t/05-map.rakutest` is the one to read if you change the map: it builds a small polyglot tree whose ranking has one right answer and asserts that answer, rather than asserting that some map came back.
+`t/03-containment.rakutest` is the file to read first if you change the resolver: it drives every escape attempt through real tool calls, including symlink escapes, and adapts rather than skips on hosts where creating a symlink is not permitted. `t/10-physical-path.rakutest` pins the resolver itself: it reads each tricky path through the OS and demands that `physical-path` names the file the OS opened, using junctions on Windows so that it needs no privilege there. `t/05-map.rakutest` is the one to read if you change the map: it builds a small polyglot tree whose ranking has one right answer and asserts that answer, rather than asserting that some map came back.
+
+`t/07-grep-parity.rakutest` is the one to read if you touch `grep`. It runs every kind of query through **every searcher installed on the machine** and asserts the answers are identical strings, skipping an arm only when its binary genuinely is not there and saying which. `t/08-grep-backend.rakutest` covers the tier choice itself — that a searcher is probed once, that a probe which got no answer is asked again, and that a search believes only an answer the searcher's documentation calls one: stand-in searchers it writes for itself exit 3, die by a signal part-way through their list, refuse with a message or fail in silence, and the answer and the spawn count show which lists were believed, that a searcher is given up only when its binary has gone or after five untrusted answers in a row, and that `reset-searchers` brings every one back. `t/07` holds the real tools to the same rule with a file in the root that nobody may read. `t/11-handles.rakutest` holds every tool to giving back every file descriptor it takes: it counts the handles the process holds open — from the kernel's own list on Linux and macOS, with `GetProcessHandleCount` on Windows — around a few hundred calls, and runs a hundred searches in a row without losing the external searcher.
 
 Examples
 --------

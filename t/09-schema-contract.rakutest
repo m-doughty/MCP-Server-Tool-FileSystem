@@ -1,0 +1,219 @@
+use Test;
+use lib 'lib';
+use MCP::Server::Tool::FileSystem::Test::Kit;
+use MCP::Server;
+use MCP::Server::Tool::FileSystem;
+
+# What each tool publishes about its own arguments, checked against what its
+# handler actually does with them.
+#
+# This is the file that would have caught the contract bug this pack shipped
+# with: a schema that names nothing required tells a model every parameter is
+# optional, and a model that believes it — models do believe it — calls fs_read
+# with no path and learns nothing from the error. So the table below is not
+# asserted on its own. Every parameter it calls required is called with that
+# parameter missing and has to come back saying so, and every default it
+# declares is checked by calling the tool twice — once omitting the argument,
+# once passing the declared default explicitly — and demanding the same answer
+# both times. A default the handler does not really apply fails there.
+
+plan 5;
+
+my $sandbox = make-sandbox('schema');
+END nuke($sandbox);
+
+$sandbox.add('tree').add('sub').mkdir;
+$sandbox.add('tree').add('alpha.txt').spurt('alpha contents');
+$sandbox.add('tree').add('sub').add('gamma.txt').spurt('gamma');
+$sandbox.add('scratch').mkdir;
+$sandbox.add('scratch').add('dup.txt').spurt("dup\ndup\n");
+$sandbox.add('scratch').add('mover.txt').spurt('mover');
+$sandbox.add('scratch').add('nonempty').mkdir;
+$sandbox.add('scratch').add('nonempty').add('keep.txt').spurt('keep');
+
+my $server = MCP::Server.new(:name<fs-schema>);
+$server.plug: MCP::Server::Tool::FileSystem.new(:root($sandbox));
+
+# One row per tool: what the schema must say, and a valid call to perturb.
+#
+# `args` is a call that works. `required` is checked by dropping each named
+# argument from it in turn; `defaults` is checked by dropping each defaulted
+# argument from `sample` and passing the declared value instead.  A tool whose
+# sample call would mutate the sandbox is given one that fails identically
+# either way (an ambiguous edit, a non-empty delete), so a default that turns
+# out to be wrong cannot take the fixtures with it.
+my @contracts = (
+	%(
+		tool     => 'fs_read',
+		required => <path>.List,
+		defaults => %(),
+		args     => %( path => 'tree/alpha.txt' ),
+	),
+	%(
+		tool     => 'fs_list',
+		required => ().List,
+		defaults => %( path => '.' ),
+		args     => %( path => 'tree' ),
+		sample   => %(),
+	),
+	%(
+		tool     => 'fs_glob',
+		required => <pattern>.List,
+		defaults => %( path => '.' ),
+		args     => %( pattern => '*.txt', path => 'tree' ),
+		sample   => %( pattern => '*.txt' ),
+	),
+	%(
+		tool     => 'fs_stat',
+		required => <path>.List,
+		defaults => %(),
+		args     => %( path => 'tree' ),
+	),
+	%(
+		tool     => 'fs_grep',
+		required => <pattern>.List,
+		defaults => %(
+			path          => '.',
+			regex         => False,
+			glob          => '',
+			'context'     => 0,
+			'max-results' => 50,
+		),
+		args   => %( pattern => 'alpha', path => 'tree' ),
+		sample => %( pattern => 'alpha' ),
+	),
+	%(
+		tool     => 'fs_map',
+		required => ().List,
+		defaults => %(
+			path        => '.',
+			query       => '',
+			focus       => '',
+			'max-chars' => 8192,
+		),
+		args   => %( path => 'tree' ),
+		sample => %(),
+	),
+	%(
+		tool     => 'fs_write',
+		required => <path content>.List,
+		defaults => %(),
+		args     => %( path => 'scratch/written.txt', content => 'written' ),
+	),
+	%(
+		tool     => 'fs_mkdir',
+		required => <path>.List,
+		defaults => %(),
+		args     => %( path => 'scratch/made' ),
+	),
+	%(
+		tool     => 'fs_edit',
+		required => <path old-string new-string>.List,
+		defaults => %( 'replace-all' => False ),
+		args     => %(
+			path         => 'scratch/dup.txt',
+			'old-string' => 'dup',
+			'new-string' => 'DUP',
+		),
+		# Two occurrences and no replace-all: an error either way, so the
+		# comparison below never writes to the file.
+		sample => %(
+			path         => 'scratch/dup.txt',
+			'old-string' => 'dup',
+			'new-string' => 'DUP',
+		),
+	),
+	%(
+		tool     => 'fs_move',
+		required => <from to>.List,
+		defaults => %(),
+		args     => %( from => 'scratch/mover.txt', to => 'scratch/moved.txt' ),
+	),
+	%(
+		tool     => 'fs_delete',
+		required => <path>.List,
+		defaults => %( recursive => False ),
+		args     => %( path => 'scratch/nonempty' ),
+		# A non-empty directory without recursive is an error either way.
+		sample => %( path => 'scratch/nonempty' ),
+	),
+);
+
+subtest 'every tool in the pack is under contract' => {
+	plan 1;
+	is-deeply @contracts.map(*<tool>).sort.List, tool-names($server),
+		'the table below covers every tool the pack publishes';
+};
+
+subtest 'the schema names exactly the required parameters' => {
+	plan @contracts.elems;
+
+	for @contracts -> %contract {
+		my %schema = tool-schema($server, %contract<tool>)<inputSchema>;
+		my $required = (%schema<required> // ()).sort.List;
+		is-deeply $required, %contract<required>.sort.List,
+			"{%contract<tool>} requires {%contract<required>.elems ?? %contract<required>.join(', ') !! 'nothing'}";
+	}
+};
+
+subtest 'the schema advertises exactly the declared defaults' => {
+	plan @contracts.elems;
+
+	for @contracts -> %contract {
+		my %props = tool-schema($server, %contract<tool>)<inputSchema><properties>;
+		my %declared = %props.kv.map(-> $name, %prop {
+			%prop<default>:exists ?? ($name => %prop<default>) !! ()
+		}).flat.Hash;
+		is-deeply %declared, %contract<defaults>.Hash,
+			"{%contract<tool>} publishes the defaults its handler applies";
+	}
+};
+
+subtest 'a required parameter really is required' => {
+	plan @contracts.map({ .<required>.elems }).sum;
+
+	# The assertion this whole file exists for: a parameter the handler dies
+	# without has to be named in the schema, because the schema is the only
+	# place a model can find that out before it calls.
+	for @contracts -> %contract {
+		for %contract<required>.list -> $name {
+			my %args = %contract<args>.Hash;
+			%args{$name}:delete;
+			errors-with $server, %contract<tool>, %args,
+				"Missing required parameter '$name'",
+				"{%contract<tool>} without $name is refused, not guessed at";
+		}
+	}
+};
+
+subtest 'an omitted argument behaves exactly like its declared default' => {
+	plan @contracts.map({ .<defaults>.elems }).sum + 2;
+
+	for @contracts -> %contract {
+		for %contract<defaults>.kv -> $name, $value {
+			my %omitted = %contract<sample>.Hash;
+			my %explicit = %contract<sample>.Hash;
+			%explicit{$name} = $value;
+
+			my %left  = call-tool($server, %contract<tool>, %omitted)<result>;
+			my %right = call-tool($server, %contract<tool>, %explicit)<result>;
+
+			my $same = (%left<isError> // False) eqv (%right<isError> // False)
+				&& %left<content> eqv %right<content>;
+			ok $same,
+				"{%contract<tool>}: omitting $name is {$value.raku}";
+			unless $same {
+				diag "omitted:  {%left.raku}";
+				diag "explicit: {%right.raku}";
+			}
+		}
+	}
+
+	# The two destructive samples ran for real; they errored, so the fixtures
+	# they name are still there.  If a declared default were wrong — a
+	# recursive that was really True — this is where it would show.
+	ok $sandbox.add('scratch').add('nonempty').add('keep.txt').e,
+		'the non-empty delete sample left its directory alone';
+	is $sandbox.add('scratch').add('dup.txt').slurp, "dup\ndup\n",
+		'the ambiguous edit sample left its file alone';
+};

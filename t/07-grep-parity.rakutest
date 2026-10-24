@@ -1,0 +1,240 @@
+use Test;
+use lib 'lib';
+use MCP::Server::Tool::FileSystem::Test::Kit;
+use MCP::Server;
+use MCP::Server::Tool::FileSystem;
+
+# fs_grep answers from one of three tiers: ripgrep or a system grep chooses
+# which files the scan opens, or nothing does and the scan opens them all. The
+# promise is that the model cannot tell which one served its call — not that
+# the answers are equivalent, that they are the SAME BYTES.
+#
+# So every query below is run through every tier this machine has, and the
+# results are compared as strings. An arm is skipped only when its binary is
+# genuinely not installed, and says which one it wanted.
+#
+# The fixture is built to punish the assumption that an external searcher's
+# file list can be used as the scan's own: it holds a symlink (which no
+# external searcher follows during a traversal, while the scan reads one whose
+# target is inside the root), a binary file and a mis-encoded one (which the
+# scan drops and ripgrep is deliberately told not to), and a 'sub' directory
+# beside a 'sub.txt' file, whose walk order — sub/b.txt before sub.txt — is the
+# opposite of every searcher's idea of sorted. And it holds a file nobody may
+# read, which makes ripgrep and both greps exit 2 for every search of the tree
+# while still listing every file they could read: an exit the pack has to
+# believe, or it would lose the external tier to one unreadable file.
+
+plan 4;
+
+my $sandbox = make-sandbox('parity');
+my $outside = make-sandbox('parity-outside');
+END {
+	try $sandbox.add('locked.txt').chmod(0o644);
+	nuke($sandbox);
+	nuke($outside);
+}
+
+$outside.add('secret.txt').spurt("alpha SECRET outside the root\n");
+
+$sandbox.add('sub').add('deep').mkdir;
+$sandbox.add('a.txt').spurt("alpha one\nbeta two\ngamma three\nalpha four\n");
+$sandbox.add('alpha.md').spurt("alpha in a markdown file\n");
+$sandbox.add('excluded.log').spurt("alpha only in a log file\n");
+$sandbox.add('no-newline.txt').spurt('alpha with no trailing newline');
+$sandbox.add('spaced.txt').spurt("two words on a line\nnot two  words\n");
+$sandbox.add('meta.txt').spurt("a.b*c literally\nab c is not it\n");
+$sandbox.add('cafe.txt').spurt("un café serré\n");
+$sandbox.add('sub').add('b.txt').spurt("alpha in sub\n");
+$sandbox.add('sub').add('deep').add('c.txt').spurt("alpha deeper\n");
+$sandbox.add('sub.txt').spurt("alpha in sub.txt\n");
+$sandbox.add('target.txt').spurt("alpha via an in-root link\n");
+# A NUL in the first bytes, and bytes that are not UTF-8 at all. Both carry
+# both needles, and neither may ever appear in an answer — while ripgrep, told
+# --text, names both as candidates. The scan is what drops them.
+$sandbox.add('binary.dat').spurt(Buf.new(0x89, 0x50, 0x00, 0x01) ~ "alpha SECRET\n".encode('utf-8'));
+$sandbox.add('latin1.txt').spurt(Buf.new(0xff, 0xe9, 0x20) ~ "alpha SECRET\n".encode('utf-8'));
+# Unreadable by mode bits, which only POSIX has; and even there not to root.
+# Where it can still be read it is an ordinary file, and the answers say so.
+$sandbox.add('locked.txt').spurt("alpha behind a lock\n");
+$sandbox.add('locked.txt').chmod(0o000) unless $*DISTRO.is-win;
+my Bool:D $locked = !(try $sandbox.add('locked.txt').slurp).defined;
+
+# Symlink creation can legitimately fail (an unprivileged Windows host, a
+# filesystem without link support), and sinking the Failure it returns would
+# throw — hence the try. The assertions adapt rather than skip: without links
+# the tree simply has two entries fewer, and the tiers must still agree.
+try $sandbox.add('target.txt').symlink($sandbox.add('link-in.txt'));
+try $outside.add('secret.txt').symlink($sandbox.add('escape.txt'));
+try $outside.symlink($sandbox.add('escape-dir'));
+my Bool:D $linked = $sandbox.add('link-in.txt').l;
+
+my $server = MCP::Server.new(:name<fs-parity>);
+$server.plug: MCP::Server::Tool::FileSystem.new(:root($sandbox));
+
+sub grep-text(%arguments --> Str:D) {
+	result-text(call-tool($server, 'fs_grep', %arguments));
+}
+
+sub backend(--> Str:D) { MCP::Server::Tool::FileSystem::grep-backend() }
+sub spawns(--> Int:D)  { MCP::Server::Tool::FileSystem::grep-backend-spawns() }
+sub believed(--> Int:D) { MCP::Server::Tool::FileSystem::grep-backend-believed() }
+
+# `external` records whether a query is one an external searcher is allowed to
+# answer: a literal search of a directory for a printable-ASCII pattern. The
+# rest — a Raku regex, a single file, a pattern normalisation could move — stay
+# on the Raku tier whatever the setting says, and the spawn count is what
+# proves it rather than a comment claiming it.
+my @queries =
+	%( name => 'a literal hit across the tree',
+	   args => %( pattern => 'alpha' ), external => True ),
+	%( name => 'a pattern nothing contains',
+	   args => %( pattern => 'nosuchneedle' ), external => True ),
+	%( name => 'the max-results cap',
+	   args => %( pattern => 'alpha', 'max-results' => 3 ), external => True ),
+	%( name => 'context windows over the whole tree',
+	   args => %( pattern => 'alpha', context => 1 ), external => True ),
+	%( name => 'context windows within one directory',
+	   args => %( pattern => 'alpha', path => 'sub', context => 2 ), external => True ),
+	%( name => 'a glob filter that excludes a matching file',
+	   args => %( pattern => 'alpha', glob => '*.md' ), external => True ),
+	%( name => 'a glob filter matching nothing',
+	   args => %( pattern => 'alpha', glob => '*.zzz' ), external => True ),
+	%( name => 'a nested subdirectory',
+	   args => %( pattern => 'alpha', path => 'sub/deep' ), external => True ),
+	%( name => 'regex metacharacters searched literally',
+	   args => %( pattern => 'a.b*c' ), external => True ),
+	%( name => 'a pattern containing a space',
+	   args => %( pattern => 'two words' ), external => True ),
+	%( name => 'a needle only the unreadable files hold',
+	   args => %( pattern => 'SECRET' ), external => True ),
+	%( name => 'a Raku regex',
+	   args => %( pattern => 'al.ha', regex => True ), external => False ),
+	%( name => 'one file rather than a directory',
+	   args => %( pattern => 'alpha', path => 'a.txt' ), external => False ),
+	%( name => 'a pattern outside ASCII',
+	   args => %( pattern => 'café' ), external => False );
+
+my Int:D $external-queries = @queries.grep({ $_<external> }).elems;
+
+# Every line an unbounded search for 'alpha' must produce, in the walk's order:
+# names sorted within each directory, each directory descended as it is reached.
+my @alpha-hits = flat
+	'a.txt:1:alpha one',
+	'a.txt:4:alpha four',
+	'alpha.md:1:alpha in a markdown file',
+	'excluded.log:1:alpha only in a log file',
+	($linked ?? ('link-in.txt:1:alpha via an in-root link',) !! ()),
+	($locked ?? () !! ('locked.txt:1:alpha behind a lock',)),
+	'no-newline.txt:1:alpha with no trailing newline',
+	'sub/b.txt:1:alpha in sub',
+	'sub/deep/c.txt:1:alpha deeper',
+	'sub.txt:1:alpha in sub.txt',
+	'target.txt:1:alpha via an in-root link';
+
+my %reference;
+
+subtest 'the Raku scan is the reference every tier is held to' => {
+	plan 12;
+
+	%*ENV<MCP_FS_GREP_BACKEND> = 'raku';
+	is backend(), 'raku', 'the backend setting pins the search to the Raku scan';
+
+	my Int:D $before = spawns();
+	%reference{$_<name>} = grep-text($_<args>) for @queries;
+	is spawns(), $before, 'which spawns nothing at all';
+
+	is-deeply %reference{'a literal hit across the tree'}.lines.List, @alpha-hits.List,
+		'Every matching line, in walk order: sub/b.txt before sub.txt, deepest last';
+
+	is %reference{'a pattern nothing contains'}, "No matches for 'nosuchneedle' under '.'",
+		'A search that matches nothing says so';
+
+	is %reference{'the max-results cap'},
+		"a.txt:1:alpha one\na.txt:4:alpha four\nalpha.md:1:alpha in a markdown file\n"
+			~ "\n[stopped at 3 matching lines; raise max-results to see more]",
+		'The cap truncates at a whole number of matching lines and says so';
+
+	is %reference{'context windows within one directory'},
+		"sub/b.txt:1:alpha in sub\n--\nsub/deep/c.txt:1:alpha deeper",
+		'Context marks the gap between two one-line files with grep\'s own separator';
+
+	is %reference{'a glob filter that excludes a matching file'},
+		'alpha.md:1:alpha in a markdown file',
+		'A glob filter keeps excluded.log out of an answer it would otherwise be in';
+
+	is %reference{'a glob filter matching nothing'}, "No matches for 'alpha' under '.'",
+		'A glob nothing matches is a search with no results, not an error';
+
+	is %reference{'regex metacharacters searched literally'}, 'meta.txt:1:a.b*c literally',
+		'Without regex, "." and "*" are themselves';
+
+	is %reference{'a pattern containing a space'}, 'spaced.txt:1:two words on a line',
+		'A pattern carrying a space is matched literally, spaces included';
+
+	# The notice this pack used to print — "[skipped N files that are not UTF-8
+	# text]" — is gone. Ripgrep passes a binary file over in silence and cannot
+	# be made to count them, and one answer is worth more than one extra fact.
+	is %reference.values.grep({ .contains('[skipped') }).elems, 0,
+		'No answer counts the files it skipped: that notice was removed for parity';
+
+	my $secret = %reference{'a needle only the unreadable files hold'};
+	ok $secret.starts-with('No matches for')
+		&& !$secret.contains('binary.dat') && !$secret.contains('latin1.txt')
+		&& !$secret.contains('escape.txt'),
+		'A needle held only by a binary file, a mis-encoded one and a link out of the root is never found';
+};
+
+sub tier-parity(Str:D $backend, Str:D $binary --> Nil) {
+	%*ENV<MCP_FS_GREP_BACKEND> = $backend;
+
+	unless backend() eq $backend {
+		skip "$backend is not usable here: '$binary' is not installed", @queries + 3;
+		return;
+	}
+
+	my Int:D $before          = spawns();
+	my Int:D $believed-before = believed();
+	my %answers = @queries.map({ $_<name> => grep-text($_<args>) });
+
+	is spawns() - $before, $external-queries,
+		"$backend answered the $external-queries literal directory searches and left the rest alone";
+	# Not merely asked: a list that is not believed costs its search a full
+	# scan, which answers exactly as the tier would have. The unreadable file
+	# makes every one of these searches exit 2.
+	is believed() - $believed-before, $external-queries,
+		"and every one of its lists was believed, so every answer really came from '$binary'";
+	is backend(), $backend, 'and it was still the tier when they were done';
+
+	for @queries -> %query {
+		is %answers{%query<name>}, %reference{%query<name>},
+			"{%query<name>}: byte for byte what the Raku scan said";
+	}
+}
+
+subtest 'ripgrep choosing the candidates changes nothing the model can see' => {
+	plan @queries + 3;
+	tier-parity('ripgrep', 'rg');
+};
+
+subtest 'a system grep choosing the candidates changes nothing either' => {
+	plan @queries + 3;
+	tier-parity('grep', 'grep');
+};
+
+subtest 'the tiers agree under concurrent load' => {
+	plan 2;
+
+	# The reason any of this exists: several searches at once used to take the
+	# VM down. Four threads over one pack, on whichever tier this machine has.
+	%*ENV<MCP_FS_GREP_BACKEND>:delete;
+	my @wanted = @queries.map({ %reference{$_<name>} }).List;
+	my @threads = (^4).map(-> $ {
+		start { @queries.map({ grep-text($_<args>) }).List }
+	}).List;
+	my @results = await @threads;
+
+	is @results.grep({ $_.elems == @queries.elems }).elems, 4,
+		'Every thread answered every query';
+	is @results.grep({ $_.List eqv @wanted.List }).elems, 4,
+		'And every answer is the one the Raku scan gives on its own';
+};

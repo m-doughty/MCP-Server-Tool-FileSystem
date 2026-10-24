@@ -1,7 +1,6 @@
 use Test;
 use lib 'lib';
-use lib 't/lib';
-use FSTest;
+use MCP::Server::Tool::FileSystem::Test::Kit;
 # NB: this file must never `use MCP::Server::Tool::FileSystem` — the whole point
 # is the path a real deployment takes, where the pack is named in configuration
 # and loaded at runtime by MCP::Server's require-based loader.

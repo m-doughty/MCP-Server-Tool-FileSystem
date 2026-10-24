@@ -2,6 +2,198 @@ Revision history for MCP::Server::Tool::FileSystem
 
 {{$NEXT}}
 
+0.2.3  2026-10-24T18:51:14+01:00
+    - BUGFIX: [2026-10-24] `grep` believes an external searcher's file list
+      only when the searcher's own documentation calls its exit an answer,
+      and gives a searcher up only when it is gone or keeps failing. A
+      searcher killed by a signal part-way through its list -- which Rakudo
+      reports as exit code 0 -- had its partial list believed, and the files
+      it never got to were silently missing from the answer; a list with a
+      signal, or with any exit status but 0, 1, or 2 with nothing on stderr,
+      now costs that search a full scan. Exit 2 with a silent stderr is what
+      ripgrep, GNU grep and BSD grep all do, told to keep quiet about
+      unreadable files, when the root holds one: it lists every file they
+      could read, so it is now believed, where before one unreadable file
+      demoted the searcher for the rest of the process. Exit 2 with a
+      message (an unknown option, memory exhausted) is a refusal and is not
+      believed. One answer that cannot be believed no longer demotes the
+      searcher; five in a row, with no believed answer between them, drop
+      it, and a believed answer starts the count again. A searcher whose
+      binary has gone since its probe is dropped by the first search that
+      misses it, so the hundreds after it spawn nothing; one that is still
+      there but could not be launched (out of file descriptors, out of
+      processes) is tried again by the next search, and that never counts
+      against it. The probe likewise no longer remembers a "no" it never
+      got: a binary that is there but could not be launched, or was killed
+      before it replied, is asked again on the next call, while a binary
+      that is not there, or that ran and gave no version, is remembered as
+      before. New public `MCP::Server::Tool::FileSystem::reset-searchers()`
+      forgets all of it -- verdicts, drops and counts -- so the next search
+      probes from scratch: a harness can bind it to a command for a user who
+      has just installed ripgrep, or whose searcher was dropped in error.
+      New t/08 subtests drive stand-in searchers the test writes for itself
+      through each case, including resets during concurrent searches, and
+      t/07 runs every installed tier against a root holding a file nobody
+      may read.
+    - BUGFIX: [2026-10-24] a long-running server on macOS no longer runs out
+      of file descriptors. Rakudo 2026.09 builds `$*DISTRO` afresh on every
+      read (it files the object it built under a key its lookup never asks
+      for; rakudo/rakudo a22cab8f9), and on macOS each build runs `sw_vers`
+      and leaves a pipe to it open. This pack reads `$*DISTRO` for every path
+      component it handles, so each `fs_read` kept a dozen descriptors and a
+      search at least one per file it walked: at macOS's default limit of 256
+      a server lasted a few dozen calls before ripgrep could not be started
+      -- and was demoted to the Raku scan for the rest of the process -- and
+      soon after that no file could be opened at all. The pack now files the
+      `$*DISTRO` Rakudo built under the key the lookup reads, once, when it
+      loads: nothing changes on a release without the bug, and on one with
+      it every path operation stops costing a process spawn. And a searcher
+      that passed its probe but then cannot be started at all -- out of
+      descriptors, out of processes, its binary being rewritten by an upgrade
+      -- is no longer demoted for good: that search scans everything and the
+      next one tries again. New t/11-handles.rakutest counts the handles the
+      process holds open (the kernel's descriptor list on Linux and macOS,
+      GetProcessHandleCount on Windows) around a few hundred calls of every
+      tool and a hundred searches in a row; a new t/08 subtest pins the
+      retry. And t/08 no longer dies on a host with no system grep, where
+      its skip was a `return` outside any routine and failed the install.
+    - SECURITY: [2026-10-01] on Windows a path segment that would open
+      some other name than it spells is refused: one holding a `:` (a data
+      stream -- link::$INDEX_ALLOCATION is the directory `link` itself,
+      whatever kind of link it is), one ending in a dot or a space (Win32
+      drops them, so secret. IS secret), and one shaped like an 8.3 short
+      name (SECRET~1, PROGRA~1.TXT, a Samba server's SECRE~A1). None of
+      them leaves the root, but each let the name a permission layer in
+      front of the pack judged differ from the name the OS opened: a client
+      rule denying C:\work\secret was walked past by SECRET~1\x, which
+      Windows opens as secret\x. The file's full name always works; a file
+      whose own long name has the short-name shape cannot be reached on
+      Windows. POSIX is unchanged: all of these are ordinary names there.
+      New t/03 subtest pins the rule on every host, and the resolver's use
+      of it under a faked $*DISTRO.
+    - SECURITY: [2026-10-01] the device names refused on every platform are
+      the whole set Windows reserves: CONIN$, CONOUT$, COM0, LPT0 and the
+      superscripts COM¹-³ and LPT¹-³ join CON, PRN, AUX, NUL and COM1-9 /
+      LPT1-9, and the name is compared as Windows compares it -- before the
+      first dot, trailing spaces dropped -- so `NUL .txt` is refused too.
+      t/03 pins them.
+    - MAINT: [2026-10-01] moved the file-time test support from
+      `t/lib/FileTimeFixture.rakumod` into
+      `lib/MCP/Server/Tool/FileSystem/Test/FileTimeFixture.rakumod`
+      (`MCP::Server::Tool::FileSystem::Test::FileTimeFixture`), declared in
+      `provides`, per the fleet-wide convention: a `t/lib` directory is its
+      own CompUnit repo that starts cold on a fresh `zef install`, and
+      parallel test files pulling a fixture's dependency chain into that
+      cold store can race and fail the install outright.
+    - SECURITY: [2026-10-01] containment on Windows resolves `..` the way
+      Windows does. The symlink chase popped `..` against wherever the walk
+      had really got to, which is the POSIX rule; Windows collapses `..` by
+      name before the filesystem sees a path, and joins a relative link
+      target onto the link's directory and collapses it the same way. So a
+      link planted inside the root -- evil.txt -> L\..\..\secret.txt, with L
+      a link two levels deeper -- was judged to stay inside while Windows
+      opened a file outside the root, and fs_read returned it. Planting one
+      needs a symbolic link inside the root (Developer Mode, an elevated
+      process, or a checkout of a repository that carries one). The chase
+      now applies each platform's own rule; POSIX is unchanged. On Windows
+      it also refuses a device-path link target (\\?\..., \\.\...) and a
+      path segment made of dots and spaces other than `.` and `..`, which
+      Win32 would rename on the way in.
+    - CHANGE: [2026-10-01] `physical-path` is public API, documented under
+      "Resolving a path the way the OS will". It is what any code naming a
+      directory for the OS to check should use in place of IO::Path.resolve,
+      which does not follow symlinks on Windows and mis-joins a junction's
+      target onto the junction's parent. App::Sadna's sandbox profiles are
+      the first outside user. New t/10-physical-path.rakutest reads every
+      case through the OS and checks the resolver names the file the OS
+      opened; directory links are junctions on Windows, so it needs no
+      privilege there.
+    - BUGFIX: [2026-10-01] `stat` reports the right modification time. It
+      read IO::Path.modified, which on 64-bit Windows puts every file
+      within about two seconds of 1970 (MoarVM builds the nanosecond
+      timestamp by multiplying libuv's `long` seconds before widening, and
+      `long` is 32 bits there) and everywhere else is 37 seconds early (the
+      leap seconds are never added). It now reads the floating-point stat
+      time, which is right on every platform, and so does the map cache's
+      freshness key. t/02 sets a file's time outright and checks `stat`
+      reports exactly it.
+    - CHANGE: [2026-09-19] the published input schema now advertises every
+      default the handlers apply: `path = '.'` on list, glob, grep and map,
+      `regex = false` and `glob = ''` and `context = 0` and
+      `max-results = 50` on grep, `query = ''` and `focus = ''` and
+      `max-chars = 8192` on map, `replace-all = false` on edit, and
+      `recursive = false` on delete. The signatures in the Pod always said so;
+      the schema the model actually reads did not, so a call that omitted
+      `path` searched the whole root and looked to the model like an answer.
+      No handler changed -- `path` is still optional and still defaults to the
+      root -- and the new t/09-schema-contract.rakutest pins every claim
+      against the handler: each required parameter is called with that
+      parameter missing and has to be refused, and each declared default is
+      checked by calling the tool with the argument omitted and with the
+      declared value, and demanding the same answer both times.
+      (The defaults reach the wire with the MCP::Server release that
+      carries a param spec's `default` into the emitted schema; against an
+      older one they are simply not published.)
+    - FIX: [2026-09-19] concurrent fs_grep calls could kill the server
+      process outright. Several recursive Raku scans at once reliably tripped
+      a garbage-collector fault in MoarVM 2026.07 ("Heap corruption detected:
+      pointer ... to past fromspace"), which prints one line and calls exit():
+      no END block, no LEAVE, no signal handler, nothing at the Raku level
+      that could catch it. Measured at six concurrent searches, grep was the
+      only tool in the pack heavy enough to trigger it, and it failed 6 runs
+      out of 6. It now takes both of the measures that measured clean:
+
+      The scanning phase of every search runs under one PROCESS-WIDE lock
+      (0/6). Process-wide rather than per-instance, because the fault is in
+      the collector and does not care how many toolkits there are.
+
+      And when ripgrep or a system grep is installed, that tool is asked which
+      files contain the pattern and the scan opens only those (0/6) -- which
+      removes the allocation volume the collector was choking on. The call to
+      the searcher is made OUTSIDE the lock, so those stay parallel.
+
+      The external tool chooses candidate files and nothing else: it never
+      produces a line of the answer, never decides the order, and never sees
+      the glob, context or max-results. Every byte a model reads still comes
+      from the same scanner over the same walk, which is what makes the tiers
+      identical by construction rather than by careful formatting. A regex
+      search never leaves Raku (the pattern is a RAKU regex, safe only because
+      Rakudo refuses to interpolate one carrying a code block; ripgrep would
+      read it as Rust syntax and grep as POSIX), and neither does a pattern
+      outside printable ASCII (Raku searches NFG text, a searcher searches
+      bytes) or a search of a single file. A host with neither tool -- a stock
+      Windows, a minimal container -- is served by the Raku scan exactly as
+      before, now serialised.
+    - CHANGE: [2026-09-19] grep no longer ends an answer with
+      "[skipped N files that are not UTF-8 text]". Ripgrep passes a binary
+      file over in silence and cannot be made to count them, so that notice
+      was the one part of the output that could not survive the question
+      "which tier served this call?". Binary and mis-encoded files are still
+      skipped, on the same NUL sniff and the same decode as before; they are
+      simply not counted. "[stopped at N matching lines; raise max-results to
+      see more]" is untouched -- every tier reproduces it.
+    - NEW: [2026-09-19] MCP_FS_GREP_BACKEND pins grep to a tier (auto,
+      ripgrep, grep or raku), and MCP_FS_GREP_RG_BINARY /
+      MCP_FS_GREP_GREP_BINARY say which binary each tier spawns. They exist
+      for t/07-grep-parity.rakutest, which runs every kind of query through
+      every searcher installed on the machine and asserts the answers are
+      identical strings; they are also the escape hatch on a host whose
+      ripgrep is installed under another name. A tier is probed at most once
+      per binary per process -- the "no" cached as firmly as the "yes" -- and
+      a searcher that fails at work is demoted for the life of the process,
+      with that search falling back and answering normally.
+    - MAINT: [2026-08-27] moved the shared test fixtures from
+      C<t/lib/FSTest.rakumod> into
+      C<lib/MCP/Server/Tool/FileSystem/Test/Kit.rakumod>
+      (C<MCP::Server::Tool::FileSystem::Test::Kit>). A C<t/lib>
+      directory is its own CompUnit repo that starts cold on a fresh
+      C<zef install>, and parallel test files pulling the fixture's
+      dependency chain into that cold store can race and fail the
+      install outright. C<lib/> is staged and precompiled before the
+      test phase runs, so shipping test support inside the dist's own
+      namespace dissolves the race. This is the fleet-wide convention
+      going forward.
+
 0.2.2  2026-08-21T21:05:33+01:00
     - Require MCP::Server 0.6.0, the release that actually ships what 0.2.1
       leans on: tool annotations in the tools/list catalog, the annotated-batch

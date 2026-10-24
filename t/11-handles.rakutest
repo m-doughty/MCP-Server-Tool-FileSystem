@@ -1,0 +1,153 @@
+use Test;
+use lib 'lib';
+use MCP::Server::Tool::FileSystem::Test::Kit;
+use MCP::Server;
+use MCP::Server::Tool::FileSystem;
+
+# A long-running server makes thousands of tool calls, so a call that keeps
+# one file descriptor is a server that stops working: at macOS's default
+# limit of 256 it is a few dozen calls before nothing can be opened, and the
+# first thing to go is the external searcher, whose spawn needs a pipe or
+# two. Rakudo 2026.09 made every call keep a dozen of them -- it builds
+# $*DISTRO afresh on every read, and on macOS each build leaves a pipe open
+# -- and the only sign in the suite was a grep tier quietly demoted under a
+# low ulimit. So this file counts.
+#
+# The counts come from the kernel: the descriptor listing on Linux and
+# macOS, GetProcessHandleCount on Windows (see open-handle-count in the
+# Kit). Every comparison is between two readings taken around the same work,
+# after a round of that work has already run once, so that whatever a first
+# call opens for good -- a thread, the event loop, a parser library -- is in
+# both. The leak this file exists for is per call, so a few hundred calls
+# show it in the hundreds; SLACK is the most the count may drift by.
+
+plan 3;
+
+my constant SLACK    = 10;
+my constant ROUNDS   = 25;
+my constant SEARCHES = 100;
+
+# Which tier the pack ought to search on, worked out by this file itself and
+# before it has done anything else: the first searcher, in the pack's order,
+# whose ordinary binary answers --version. Asking the pack instead would let a
+# pack that has run the process out of descriptors -- and so failed its own
+# probe -- report "nothing is installed here" and have the last subtest agree.
+my $first-answering = ('ripgrep' => 'rg', 'grep' => 'grep').first({ answers-version(.value) });
+my Str:D $installed = $first-answering.defined ?? $first-answering.key !! 'raku';
+
+sub answers-version(Str:D $binary --> Bool:D) {
+	my $proc = try run($binary, '--version', :in(False), :out, :err);
+	return False without $proc;
+	my $out = (try $proc.out.slurp(:close)) // '';
+	try $proc.err.slurp(:close);
+	so $proc.exitcode == 0 && $proc.signal == 0 && $out.chars;
+}
+
+my $sandbox = make-sandbox('handles');
+END nuke($sandbox);
+
+$sandbox.add('sub').add('deep').mkdir;
+$sandbox.add('a.txt').spurt("alpha one\nbeta two\n");
+$sandbox.add('sub').add('b.txt').spurt("alpha in sub\n");
+$sandbox.add('sub').add('deep').add('tool.py').spurt("def alpha():\n    return 1\n");
+
+my $server = MCP::Server.new(:name<fs-handles>);
+$server.plug: MCP::Server::Tool::FileSystem.new(:root($sandbox));
+
+my constant ANSWER = "a.txt:1:alpha one\nsub/b.txt:1:alpha in sub\nsub/deep/tool.py:1:def alpha():";
+
+sub search(--> Str:D) {
+	result-text(call-tool($server, 'fs_grep', { pattern => 'alpha' }));
+}
+
+sub backend(--> Str:D) { MCP::Server::Tool::FileSystem::grep-backend() }
+sub spawns(--> Int:D)  { MCP::Server::Tool::FileSystem::grep-backend-spawns() }
+sub believed(--> Int:D) { MCP::Server::Tool::FileSystem::grep-backend-believed() }
+
+#| How far the handle count moved across &work.
+sub drift(&work --> Int:D) {
+	my Int:D $before = open-handle-count();
+	work();
+	open-handle-count() - $before;
+}
+
+subtest '$*DISTRO is one object for the life of the process' => {
+	plan 2;
+
+	# The root of it. The pack reads $*DISTRO for every path component it
+	# splits, chases or compares, so a $*DISTRO that is rebuilt on every
+	# read is a cost on every call -- and on macOS, a descriptor.
+	ok $*DISTRO === $*DISTRO, 'Two reads of $*DISTRO return the same object';
+
+	my Int:D $drift = drift({ my $windows; $windows = $*DISTRO.is-win for ^500 });
+	ok $drift <= SLACK, "and 500 reads of it hold no handle open (the count moved by $drift)";
+};
+
+subtest 'every tool gives back every handle it takes' => {
+	plan 3;
+
+	# Every tool, so every path through the resolver: reads, a search of a
+	# tree and of one file, the map, and a write, an edit, a move, a mkdir and
+	# two deletes -- each of which resolves its path, and the move two of them.
+	my @calls =
+		'fs_read'   => { path => 'a.txt' },
+		'fs_list'   => { path => 'sub' },
+		'fs_stat'   => { path => 'sub/b.txt' },
+		'fs_glob'   => { pattern => '*.txt' },
+		'fs_grep'   => { pattern => 'alpha' },
+		'fs_grep'   => { pattern => 'alpha', path => 'a.txt' },
+		'fs_map'    => { path => 'sub' },
+		'fs_write'  => { path => 'sub/scratch.txt', content => 'one' },
+		'fs_edit'   => { path => 'sub/scratch.txt', 'old-string' => 'one', 'new-string' => 'two' },
+		'fs_move'   => { from => 'sub/scratch.txt', to => 'sub/moved.txt' },
+		'fs_delete' => { path => 'sub/moved.txt' },
+		'fs_mkdir'  => { path => 'sub/made' },
+		'fs_delete' => { path => 'sub/made' };
+
+	# Eager: a lazy List that is only sunk would never make the calls at all.
+	my sub round(--> List:D) { @calls.map({ call-tool($server, .key, .value) }).eager.List }
+
+	my @failed = round().grep(&result-errored);
+	is @failed.elems, 0, "A first round of all {@calls.elems} calls succeeds, so each one did its work";
+	diag "a call failed: {result-text($_)}" for @failed;
+
+	my @responses;
+	my Int:D $drift = drift({ @responses.append: round() for ^ROUNDS });
+	is @responses.grep({ !result-errored($_) }).elems, ROUNDS * @calls.elems,
+		"{ROUNDS} more rounds, {ROUNDS * @calls.elems} calls, all made and all successful";
+	ok $drift <= SLACK, "and they hold no handle open (the count moved by $drift)";
+};
+
+subtest 'a long run of searches keeps its external searcher' => {
+	plan 6;
+
+	# What the leak looked like from outside: after a few dozen searches the
+	# searcher could no longer be started, and the pack fell back to scanning
+	# every file for the rest of its life. Every search here is a literal
+	# search of a directory, so every one of them goes to the searcher when
+	# there is one; on a host with none, the scan answers them all and
+	# spawns nothing, and the handle count is still held to account.
+	%*ENV<MCP_FS_GREP_BACKEND>:delete;
+	%*ENV<MCP_FS_GREP_RG_BINARY>:delete;
+	%*ENV<MCP_FS_GREP_GREP_BINARY>:delete;
+	my Bool:D $external = $installed ne 'raku';
+	is backend(), $installed, $external
+		?? "The pack searches with $installed, the first searcher here that answers --version"
+		!! 'No searcher here answers --version, so the pack searches with the Raku scan';
+	search();
+
+	my Int:D $before          = spawns();
+	my Int:D $believed-before = believed();
+	my @answers;
+	my Int:D $drift = drift({ @answers = (^SEARCHES).map({ search() }) });
+
+	is spawns() - $before, ($external ?? SEARCHES !! 0), $external
+		?? "$installed was started for every one of the {SEARCHES} searches"
+		!! "and the scan answered all {SEARCHES} searches and started nothing";
+	is believed() - $believed-before, ($external ?? SEARCHES !! 0), $external
+		?? 'and every list it gave was believed'
+		!! 'and believed no list, there being none to believe';
+	is backend(), $installed, 'and the tier never changed on the way';
+	is-deeply @answers.unique.List, (ANSWER,), 'Every search gave the same, complete answer';
+	ok $drift <= SLACK, "and none of them held a handle open (the count moved by $drift)";
+};

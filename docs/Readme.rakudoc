@@ -100,6 +100,16 @@ empty prefix registers bare names.
 Names below are unprefixed. With the default prefix they are C<fs_read>,
 C<fs_write> and so on.
 
+The headings below are the whole signature, and the published JSON Schema
+says the same thing: a parameter with no C<=> in its heading is in the
+schema's C<required> array, and a parameter shown as C<path = '.'> carries
+that value as its JSON Schema C<default>. Both matter more than they look.
+A schema that marked nothing required would tell a model that C<read> may
+be called with no C<path> — and a model that believes it (they do) spends
+its call on an error instead of an answer. A schema that hid the defaults
+would leave a model unable to tell C<grep> without a C<path> (the whole
+root) from C<grep> with one.
+
 =head3 Parameter naming
 
 Parameter names in this pack are a contract, not a matter of taste:
@@ -130,7 +140,11 @@ one mutation lock for the read plus its revision digest, which is the same
 lock the mutators take.
 =item C<map> takes the map cache's own lock around the whole map, so two maps
 of one tree cannot tear the per-file parse cache between them.
-=item C<glob> and C<grep> touch no instance state at all.
+=item C<glob> touches no instance state at all, and C<grep> touches none
+either — but its scanning phase runs under one B<process-wide> lock, so
+two searches never read files at the same time however many packs there
+are. That is a VM-level requirement rather than a coherence one, and
+L<How grep searches|#how-grep-searches> says why.
 
 Several reads on B<one> pack instance therefore see coherent state. What the
 annotations do B<not> promise is anything about the filesystem underneath: a
@@ -327,7 +341,7 @@ The rest of the parameters bound what comes back:
 =item C<glob> filters by B<file name only>, using the same matcher as the glob tool, at any depth. A C</> in it is refused — filter names with C<glob>, choose where to look with C<path>.
 =item C<context> (0 to 20) shows surrounding lines, marked with C<-> instead of C<:> so they cannot be mistaken for matches, and separates non-adjacent groups with C<-->.
 =item C<max-results> (1 to 1000, default 50) stops the search after that many I<matching> lines and says so. Files are visited in sorted order, so a truncated result is the same result every time.
-=item Files that are not UTF-8 text — a NUL byte in the first 8KB, or bytes that will not decode — are skipped, and a trailing notice counts them.
+=item Files that are not UTF-8 text — a NUL byte in the first 8KB, or bytes that will not decode — are skipped in silence. Nothing counts them; L<How grep searches|#how-grep-searches> says why that notice was removed.
 
 =begin code
 { "name": "fs_grep", "arguments": { "pattern": "yak", "context": 1 } }
@@ -346,6 +360,226 @@ The rest of the parameters bound what comes back:
 =end code
 
 C<grep> is a reading tool: it is registered even when C<read-only> is set.
+I<How> it searches — and why it would rather have ripgrep pick the files it
+opens — is L<How grep searches|#how-grep-searches>, below.
+
+=head3 How grep searches
+
+C<grep> runs its own scan over its own walk and formats every byte of its own
+answer. What it will hand to an outside tool — and only when there is one —
+is the question I<which files are worth opening at all>:
+
+=item B<ripgrep>, if C<rg> is on the PATH.
+=item B<a system C<grep>>, if that is there and C<rg> is not.
+=item B<nothing>, on a host with neither (a stock Windows, most minimal
+containers). The scan then opens every file below the path, exactly as this
+pack always did.
+
+The three tiers return B<the same bytes>. They have to: the external tool
+never produces a line of the answer, never decides the order, and never sees
+the C<glob>, the C<context> or the C<max-results>. It answers one question,
+its answer is used as a B<filter> over the ordinary walk, and everything the
+model reads is then produced by the same scanner it always was.
+C<t/07-grep-parity.rakutest> runs every query through every tier installed on
+the machine and compares the results as strings.
+
+=head4 Why
+
+A recursive Raku scan — walk, slurp, decode, split, search — is the heaviest
+thing in this pack by allocation volume, and several at once reliably tripped
+a garbage-collector fault in MoarVM 2026.07 that killed the whole process:
+
+=begin code :lang<text>
+MoarVM panic: Heap corruption detected: pointer 0x... to past fromspace
+=end code
+
+Nothing at the Raku level can catch that — the VM prints one line and calls
+C<exit()>, so no C<END> block, no C<LEAVE>, no signal handler runs. It is a VM
+bug rather than this pack's, but a search tool that takes the server down when
+a model asks two questions at once is this pack's problem. Two measures fixed
+it at six concurrent searches, and both are in:
+
+=item The scanning phase runs under B<one process-wide lock>. Process-wide and
+not per-instance, because the fault is in the collector and does not care how
+many toolkits there are.
+=item When an external searcher is available, the scan only opens the files it
+named — usually a handful instead of a tree — so the allocation the collector
+was choking on never happens. The call to the searcher is made B<outside> the
+lock, so those still run in parallel.
+
+=head4 What is asked, exactly
+
+=begin code :lang<shell>
+rg --files-with-matches --no-config --no-ignore --hidden --no-follow \
+   --no-messages --text --fixed-strings -- <pattern> <absolute directory>
+
+grep -r -l -F -a -s -- <pattern> <absolute directory>
+=end code
+
+Every flag is there to make the searcher's idea of "worth opening" a
+B<superset> of the scan's. C<--no-ignore> because a C<.gitignore> is not this
+pack's filter (the root is); C<--hidden> because the walk does not skip
+dotfiles; C<--no-follow> because it does not descend symlinked directories;
+C<--text> and C<-a> because a binary file must still be listed — dropping it
+is the B<scan's> decision, taken on the same NUL sniff as always;
+C<--no-config> because a user's C<rg> configuration file must not be able to
+change what a tool call returns. The searcher runs with C<LC_ALL=C> and
+without C<GREP_OPTIONS>, C<GREP_COLORS> or C<RIPGREP_CONFIG_PATH>.
+
+The C<glob> parameter is deliberately B<not> passed on: its dialect is this
+pack's, not ripgrep's, and the scan applies it. Neither searcher's own file
+list is used for paths or for order, either — their idea of sorted (C<a/b>
+before C<a.txt>) is not the walk's (C<a> before C<a.txt>, then descend).
+
+Two kinds of file are opened whatever the searcher said about them, because
+its silence cannot mean anything: a B<symlink> (no searcher follows one it
+meets during a traversal, while this pack reads one whose target is inside the
+root) and a name carrying a B<line break> (which cannot be found in a list
+that arrives one path per line).
+
+=head4 What never leaves Raku
+
+=item A B<regex> search. The pattern is a I<Raku> regex, and it is only safe
+because Rakudo refuses to interpolate one containing a code block — see
+L<Regex interpolation|#regex-interpolation>. Ripgrep would read it as Rust
+regex syntax and a system grep as POSIX: silently, and with different matches.
+=item A pattern that is not B<printable ASCII>. Raku decodes a file to NFG
+text before searching it, so a composed C<é> in the pattern matches a decomposed
+one in the file; a byte-oriented searcher would not, and the tiers would
+disagree.
+=item A search of a single B<file> rather than a directory. There is one
+candidate and choosing it externally would be pure overhead.
+
+=head4 The probe, and how long it is remembered
+
+A searcher counts as usable only once it has actually run and answered
+C<--version>. That costs a process spawn, so the verdict is taken B<once per
+binary per process> and never revisited — the "no" as firmly as the "yes",
+since paying a failed spawn on every search would cost more than the tier
+saves. "No" means the binary is not there, or that it ran and gave no version:
+exited non-zero, or printed nothing. A probe that gets B<no answer at all> is
+not a verdict, and is not kept: a binary that is there but could not be
+launched — the server out of file descriptors, the system out of processes,
+the binary being rewritten by an upgrade — or one killed by a signal before it
+replied is asked again on the next call. A searcher that passed its probe and
+later cannot be launched is looked for the same way: if its binary has gone,
+it is dropped there and then, as if its probe had said no, and the searches
+after it spawn nothing; if it is still there, the failure is the moment's,
+the next search tries again, and it is not held against the searcher.
+
+=head4 Which answers are believed
+
+After the probe, each search decides whether B<its own> answer can be
+believed. One that cannot costs that search a full scan and not the tier —
+until a searcher has given B<five> in a row with no believed answer between
+them, which drops it as a failed probe would. One bad answer is as likely to
+be the moment (an OOM-killed child, an unlucky list) as the tool, and giving a
+searcher up over it would leave a long-running server slow for the rest of its
+life; five in a row is the tool, and hundreds of searches should not each pay
+a spawn and a scan for it. A believed answer starts the count again, and a
+launch that failed while the binary was there never counts. An answer is
+believed when the searcher was not killed by a signal and exited with a
+status its documentation calls an answer.
+ripgrep's man page gives 0 for a match, 1 for none and 2 for an error; GNU
+grep's gives the same three; BSD grep's and POSIX's give 0, 1, and anything
+above 1 for an error. So:
+
+=item B<0 or 1> is an answer.
+=item B<2 with nothing on stderr> is an answer too. This pack runs every
+searcher with C<--no-messages> or C<-s>, which silence exactly the complaints
+about files it could not open or read, and all three tools still exit 2 for
+one; a root holding a single unreadable file would otherwise cost every search
+a full scan. The list such a run prints names every file the tool could read,
+and the scan cannot read the rest either, so it is the list a clean run would
+have printed.
+=item B<2 with a message> is a refusal — an option it does not know, memory
+exhausted — and is not believed.
+=item B<Anything else> is not believed: any other status, a child killed by a
+signal (which Rakudo reports as exit code 0, with the list cut short wherever
+the signal landed), a launch that never happened, output that is not a list of
+absolute paths.
+
+Measured on ripgrep 14.1.1, GNU grep 3.12 and BSD grep 2.6.0: an unreadable
+file or directory exits 2 with every readable match listed and stderr empty,
+and an unknown option exits 2 with nothing listed and a message on stderr.
+
+The consequence worth stating plainly: installing C<rg> while a server is
+running does not speed up that server, only the next one — unless whatever
+hosts the pack calls C<reset-searchers>, below.
+
+=head4 Overriding it
+
+=begin table
+Variable                | Value                 | Effect
+======================= | ===================== | ======
+MCP_FS_GREP_BACKEND     | auto (default)        | ripgrep if it is there, else a system grep, else the Raku scan
+MCP_FS_GREP_BACKEND     | ripgrep               | only ripgrep; the Raku scan when it is unusable
+MCP_FS_GREP_BACKEND     | grep                  | only a system grep; the Raku scan when it is unusable
+MCP_FS_GREP_BACKEND     | raku                  | never shell out
+MCP_FS_GREP_RG_BINARY   | a binary name or path | what the ripgrep tier spawns; defaults to rg
+MCP_FS_GREP_GREP_BINARY | a binary name or path | what the grep tier spawns; defaults to grep
+=end table
+
+Any other value of MCP_FS_GREP_BACKEND is an error on the call rather than a
+silent fallback, so a typo cannot quietly cost a tier.
+
+They exist for the parity tests, which have to pin a search to a tier they
+choose, and they are read on every call rather than cached. The binary
+overrides must name the real tool: a searcher that runs happily and prints
+something B<else> cannot be detected, only believed.
+
+=head4 Re-checking the searchers
+
+Everything the pack learns about the searchers — every probe verdict, the
+"yes" and the "no" alike, every searcher dropped, every count of answers that
+could not be believed — lasts for the life of the process.
+C<MCP::Server::Tool::FileSystem::reset-searchers()> forgets all of it, so the
+next search probes again from scratch: a ripgrep installed since the first
+search is found, and a searcher dropped in error is given its chance back.
+
+=begin code :lang<raku>
+our sub reset-searchers(--> Nil)
+=end code
+
+It is a library function rather than a tool, because whether the host's
+programs have changed is the host's question, not the model's. It is
+process-wide, like the state it clears, which every pack instance in the
+process shares. It is safe to call while searches are running — a search
+already under way finishes on what it had — and safe to call again, since
+clearing nothing changes nothing. It leaves C<MCP_FS_GREP_BACKEND> alone; that
+is read on every search anyway.
+
+A harness that serves the pack to a user is the natural caller: bind it to a
+command, so the user can say "I have just installed ripgrep" without
+restarting anything.
+
+=begin code :lang<raku>
+use MCP::Server::Tool::FileSystem;
+
+# One entry in a harness's own command table.
+my %commands = rescan => {
+    MCP::Server::Tool::FileSystem::reset-searchers();
+    'The next search looks for ripgrep and a system grep again.';
+};
+
+# ...and when the user types /rescan:
+say %commands<rescan>();
+=end code
+
+=head4 The notice that is gone
+
+C<grep> used to end an answer that had skipped unreadable files with
+
+=begin code :lang<text>
+[skipped 2 files that are not UTF-8 text]
+=end code
+
+That line has been B<removed>. Ripgrep passes a binary file over in silence
+and cannot be made to count them, so the notice was the one part of the output
+that could not survive the question "which tier served this call?". Identical
+answers are worth more than the count was. The other notice — C<[stopped at N
+matching lines; raise max-results to see more]> — is unchanged: every tier
+reproduces it, because every tier counts the same matched lines.
 
 =head3 map(path = '.', query?, focus?, max-chars = 8192)
 
@@ -529,9 +763,10 @@ each hold on their own. For a path argument C<$rel>:
 
 =item B<Relative only.> Anything that could be absolute is rejected textually, before any filesystem call: a leading C</> or C<\>, a C<X:> drive prefix, or a C<\\server\share> UNC prefix.
 =item B<No C<..> at all.> C<..> segments are refused even when the result would have stayed inside the root (C<a/../b> is an error, not a synonym for C<b>). One rule is easier to audit than an arithmetic one.
-=item B<No device names.> Segments Windows resolves to devices regardless of directory — C<CON>, C<PRN>, C<AUX>, C<NUL>, C<COM1>..C<COM9>, C<LPT1>..C<LPT9>, with or without an extension — are refused on every platform, so behaviour is identical everywhere rather than only safe where it is tested.
+=item B<No device names.> Segments Windows resolves to devices regardless of directory — C<CON>, C<PRN>, C<AUX>, C<NUL>, C<CONIN$>, C<CONOUT$>, C<COM0>..C<COM9>, C<LPT0>..C<LPT9> and the superscript C<COM¹>..C<COM³>, C<LPT¹>..C<LPT³>, with or without an extension and with trailing spaces before it (C<NUL .txt> is C<NUL>) — are refused on every platform, so behaviour is identical everywhere rather than only safe where it is tested.
+=item B<On Windows, no name that opens another name.> A segment holding a C<:> (C<x:stream> is a data stream of C<x>, and C<link::$INDEX_ALLOCATION> is the directory C<link> itself), one ending in a dot or a space (Win32 drops them: C<secret.> B<is> C<secret>), and one shaped like an 8.3 short name (a base of up to eight characters holding a C<~> and a letter or digit, at most a three-letter extension: C<SECRET~1>, C<PROGRA~1.TXT>, a Samba server's C<SECRE~A1>) are refused. None of them escapes the root, but each lets the name a permission layer in front of this pack judged differ from the name the OS opens — a rule about C<secret> walked past by C<SECRET~1>. The file's full name always works. On POSIX all of these are ordinary names.
 =item B<No null bytes.>
-=item B<Physical-path symlink chase.> The candidate path is built segment by segment under the root; then every symlink in it is chased to its destination — component by component, the way C<realpath> works, with a hop budget against cycles — and the I<physical> result is checked against the root. A symlink planted inside the sandbox therefore cannot be used as a door out of it, whether it points at a file or a directory, whether directly or through a chain, and whether its target is absolute or relative. The chase is the pack's own (over C<readlink>), B<not> C<IO::Path.resolve>, because C<.resolve> does not follow symlinks on Windows — an unfollowed link is an open door the OS walks through at open time even though a check did not. One code path runs on every platform. A link whose target cannot be read, a chain that exceeds the hop budget, and a Windows drive-relative target (C<C:foo>) are all refused outright: fail closed.
+=item B<Physical-path symlink chase.> The candidate path is built segment by segment under the root; then every symlink in it is chased to its destination — component by component, the way C<realpath> works, with a hop budget against cycles — and the I<physical> result is checked against the root. A symlink planted inside the sandbox therefore cannot be used as a door out of it, whether it points at a file or a directory, whether directly or through a chain, and whether its target is absolute or relative. The chase is the pack's own (over C<readlink>), B<not> C<IO::Path.resolve>, because C<.resolve> does not follow symlinks on Windows — an unfollowed link is an open door the OS walks through at open time even though a check did not. One code path runs on every platform, and it resolves C<..> the way I<this> platform's OS does: physically on POSIX, by name on Windows (see L<#Resolving a path the way the OS will>). A link whose target cannot be read, a chain that exceeds the hop budget, a Windows drive-relative (C<C:foo>) or device-path (C<\\?\…>) target, and a Windows segment of dots and spaces other than C<.> and C<..> are all refused outright: fail closed.
 =item B<Parent-chain containment, not string prefixes.> The final check walks C<.parent> from the chased path up to the filesystem root looking for the root itself. C</srv/root2> is not inside C</srv/root>, and no separator-spelling difference can fake a match — on Windows both slash spellings are unified before comparing.
 
 The textual rejections are deliberately redundant with the physical check:
@@ -581,12 +816,101 @@ costs one clear error rather than a partial traversal.
 Residual risks worth knowing:
 
 =item A symlink already inside the root that points I<within> the root is followed, by design. If you populate the sandbox from an untrusted source, populate it without symlinks.
-=item On a platform whose C<resolve> does not fully canonicalise (older Windows), a pre-planted in-root symlink pointing outside could in principle survive the ancestor check. The C<..>/absolute/device rejections still hold; treat the root as a directory you control the contents of.
+=item Windows 8.3 short names (C<PROGRA~1>) are not expanded. In a path argument one is refused (see above). In a link target, a short name never matches a root spelt long, or the other way round, so it is refused: a false denial, never an escape. Configure the root the way the OS reports it. A file whose own long name has the short-name shape (C<DATA~1.TXT>) cannot be reached by this pack on Windows.
 =item Confinement is not a permission system. Anything the server process can read under the root, the model can read, and on a read-write pack anything it can write, the model can C<delete>. Run it as a user with no more access than you intend to grant, use C<read-only> unless writes are actually wanted, and put a permission layer in front of it if "the whole root" is more than you meant to hand over.
 =item C<delete> with C<recursive> is C<rm -rf>, applied to a path the model chose. It refuses the root itself and it unlinks symlinks rather than following them, but within the root it is exactly as final as it sounds. This is the tool to gate behind a permission layer first.
 =item C<move> is a rename and only a rename. If the root spans a mount point — a bind mount, a network share grafted into the tree — a move across it fails with the OS's own error instead of silently copying and deleting. Honest, but it means such a move is simply not available; do it with C<read> and C<write> if you must.
 =item Conditional revisions are authoritative among calls through one toolkit instance. An unrelated process writing the same filesystem does not take this lock, so it can still race between the toolkit's comparison and operating-system mutation. Its completed changes are detected by the next comparison; it does not participate atomically.
-=item Nothing here rate-limits or size-limits: C<read> will happily slurp a huge file into memory, C<glob> will walk a huge tree, and C<grep> reads every text file below the path it is given (C<max-results> bounds the I<output>, not the reading). C<map> is the one exception — it prunes, skips files over 1MB, stops after 5000 files and bounds its own output — but its first pass over a large tree still costs a parse of every source file in it. Point the pack at a workspace, not at C</>.
+=item Nothing here rate-limits or size-limits: C<read> will happily slurp a huge file into memory, C<glob> will walk a huge tree, and C<grep> walks the whole tree below the path it is given — opening every text file in it when no external searcher is installed, and only the files one named when there is (C<max-results> bounds the I<output>, not the walking). C<map> is the one exception — it prunes, skips files over 1MB, stops after 5000 files and bounds its own output — but its first pass over a large tree still costs a parse of every source file in it. Point the pack at a workspace, not at C</>.
+
+=head2 Resolving a path the way the OS will
+
+The resolver behind containment is public, for any code that has to name a
+directory where the operating system will check it: a sandbox profile that
+lists the paths a child may write, a lock keyed on a path, a "which root is
+this under" test of your own.
+
+=begin code :lang<raku>
+use MCP::Server::Tool::FileSystem;
+
+my &physical = &MCP::Server::Tool::FileSystem::physical-path;
+
+# /srv/current -> releases/42
+say physical('/srv/current/notes.txt'.IO);   # "/srv/releases/42/notes.txt".IO
+
+# C:\Users\me\work is a junction to D:\work
+say physical('C:\Users\me\work\src'.IO);     # "D:/work/src".IO
+
+# Paths that do not exist yet are kept as far as they go.
+say physical('/srv/current/not/yet'.IO);     # "/srv/releases/42/not/yet".IO
+=end code
+
+C«physical-path(IO::Path:D $path, Int:D :$max-hops = 40 --> IO::Path:D)»
+makes C<$path> absolute against C<$*CWD>, then walks it one component at a
+time. Every component that is a link — a symlink anywhere, and on Windows a
+junction too — is replaced by its target and the walk carries on from there,
+so a link in the middle of a path is followed just like one at the end. The
+result is absolute and link-free as far as the path exists. Windows paths
+come back with an upper-case drive letter; C<.absolute> gives the native
+spelling.
+
+=head3 Why not C<IO::Path.resolve>
+
+C<.resolve> is the right tool on POSIX and the wrong one on Windows. It does
+not follow symbolic links there, and when it meets a junction it splices the
+junction's absolute target onto the junction's parent and returns a path
+that does not exist. C<physical-path> is one implementation on every
+platform.
+
+=head3 C<..> follows the platform's rule
+
+The two families disagree about what C<..> means once a link is involved,
+and the resolver has to agree with the OS it runs on, or a path the check
+calls inside is one the OS opens outside. Take C<one/L/../x.txt>, where
+C<L> is a link to C<deep/a/b>:
+
+=item B<POSIX> resolves C<..> physically: it is the parent of wherever the
+walk has really got to. C<L> takes the walk to C<deep/a/b>; C<..> is
+C<deep/a>; the answer is C<deep/a/x.txt>.
+
+=item B<Windows> resolves C<..> by name. Win32 collapses it out of the path
+before the filesystem sees it, so the answer is C<one/x.txt> and C<L> is never
+consulted. A link whose target is relative is joined onto the link's
+directory and collapsed the same way before anything in it is followed: a
+target of C<L\..\..\x> climbs two levels from the link, whatever C<L> points
+at.
+
+C<t/10-physical-path.rakutest> reads each such path through the OS and
+checks that C<physical-path> names the file the OS opened.
+
+=head3 Failing closed
+
+C<physical-path> dies rather than guess when:
+
+=item a link's target cannot be read;
+=item a chain is longer than C<:max-hops> (a cycle, in practice);
+=item on Windows, a link target is drive-relative (C<C:foo>, which depends
+on a per-drive working directory) or a device path (C<\\?\…>, C<\\.\…>);
+=item on Windows, a segment is made of dots and spaces but is not C<.> or
+C<..> (Win32 renames such segments on the way in).
+
+=head3 A containment check with it
+
+Resolve both sides, then compare. Resolving only the candidate means a root
+reached through a link never matches:
+
+=begin code :lang<raku>
+my $root = physical($workspace.IO).absolute;
+my $p    = physical($candidate.IO).absolute;
+my $sep  = $*SPEC.dir-sep;
+die "outside the workspace: $candidate"
+    unless $p eq $root || $p.starts-with($root.ends-with($sep) ?? $root !! $root ~ $sep);
+=end code
+
+The comparison is exact-case, so on a case-insensitive filesystem a
+mismatch in case denies rather than admits. What a resolver cannot defend
+against is the filesystem changing after the check: resolve, check and open
+as close together as you can.
 
 =head2 Testing
 
@@ -598,10 +922,32 @@ prove6 -Ilib -I../MCP-Server/lib t/    # against a sibling checkout
 C<t/03-containment.rakutest> is the file to read first if you change the
 resolver: it drives every escape attempt through real tool calls, including
 symlink escapes, and adapts rather than skips on hosts where creating a
-symlink is not permitted. C<t/05-map.rakutest> is the one to read if you
+symlink is not permitted. C<t/10-physical-path.rakutest> pins the resolver
+itself: it reads each tricky path through the OS and demands that
+C<physical-path> names the file the OS opened, using junctions on Windows so
+that it needs no privilege there. C<t/05-map.rakutest> is the one to read if you
 change the map: it builds a small polyglot tree whose ranking has one right
 answer and asserts that answer, rather than asserting that some map came
 back.
+
+C<t/07-grep-parity.rakutest> is the one to read if you touch C<grep>. It runs
+every kind of query through B<every searcher installed on the machine> and
+asserts the answers are identical strings, skipping an arm only when its
+binary genuinely is not there and saying which. C<t/08-grep-backend.rakutest>
+covers the tier choice itself — that a searcher is probed once, that a probe
+which got no answer is asked again, and that a search believes only an answer
+the searcher's documentation calls one: stand-in searchers it writes for
+itself exit 3, die by a signal part-way through their list, refuse with a
+message or fail in silence, and the answer and the spawn count show which
+lists were believed, that a searcher is given up only when its binary has gone
+or after five untrusted answers in a row, and that C<reset-searchers> brings
+every one back. C<t/07> holds the real tools to the same rule with a file in
+the root that nobody may read.
+C<t/11-handles.rakutest> holds every tool to giving back every file descriptor
+it takes: it counts the handles the process holds open — from the kernel's own
+list on Linux and macOS, with C<GetProcessHandleCount> on Windows — around a
+few hundred calls, and runs a hundred searches in a row without losing the
+external searcher.
 
 =head2 Examples
 
