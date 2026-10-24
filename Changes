@@ -2,6 +2,10 @@ Revision history for MCP::Server::Tool::FileSystem
 
 {{$NEXT}}
 
+0.2.4  2026-10-24T19:29:01+01:00
+    - HOTFIX: [2026-10-24] Windows filesystem testing checks for errors on
+      POSIX reqs.
+
 0.2.3  2026-10-24T18:51:14+01:00
     - BUGFIX: [2026-10-24] `grep` believes an external searcher's file list
       only when the searcher's own documentation calls its exit an answer,

@@ -1222,18 +1222,34 @@ my sub join-parts(Str:D $volume, @parts --> IO::Path:D) {
 #| mistaken for a child of /srv/root; separator spelling is unified on Windows
 #| before comparing, where either slash may appear.  Comparison is exact-case:
 #| on a case-insensitive filesystem a case-mismatched root can only deny
-#| access, never grant it.  Exposed with `our` scope for the containment
-#| tests — not part of the public API.
+#| access, never grant it.  Total: it returns for any pair of paths (see
+#| climb-limit).  Exposed with `our` scope for the containment tests — not
+#| part of the public API.
 our sub path-contains(IO::Path:D $root, IO::Path:D $path --> Bool:D) {
+	my Int $steps = climb-limit($path);
+	return False without $steps;
 	my Str $root-key = path-key($root);
 	my $p = $path;
-	loop {
+	for ^$steps {
 		return True if path-key($p) eq $root-key;
 		my $up = $p.parent;
 		last if $up.absolute eq $p.absolute;   # reached the filesystem root
 		$p = $up;
 	}
 	False;
+}
+
+# How many steps a walk up $path's parents may take: undefined for a path
+# that is not absolute, whose parents never end — the parent of '..' is
+# '../..', and so on for ever, each one a longer string than the last — and
+# otherwise one more than the length of its absolute spelling, since every
+# step that does not stop the walk removes at least one character.  Every
+# path the resolver builds is absolute; a relative one can only be made by
+# applying one platform's rules to another's spelling (a Windows stand-in for
+# $*DISTRO on POSIX meeting a link to 'C:\x'), and the walks refuse it rather
+# than climb for ever.
+my sub climb-limit(IO::Path:D $path --> Int) {
+	$path.is-absolute ?? $path.absolute.chars + 1 !! Int;
 }
 
 # The comparison spelling of a path: separators unified on Windows, the
@@ -1256,9 +1272,11 @@ my sub file-mtime(IO::Path:D $path --> Instant:D) {
 }
 
 my sub relative-parts(IO::Path:D $root, IO::Path:D $path --> List) {
+	my Int $steps = climb-limit($path);
+	die "Cannot place '$path' under the root: it is not an absolute path" without $steps;
 	my @parts;
 	my $p = $path;
-	loop {
+	for ^$steps {
 		last if $p.absolute eq $root.absolute;
 		my $up = $p.parent;
 		last if $up.absolute eq $p.absolute;
