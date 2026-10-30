@@ -1,0 +1,121 @@
+use Test;
+use lib 'lib';
+use MCP::Server::Tool::FileSystem::Test::Kit;
+use MCP::Server;
+use MCP::Server::Tool::FileSystem;
+
+# IO::Path.slurp(:bin) dies at exactly 1048576 bytes on Rakudo 2026.09
+# ("Out of range: attempted to read 0 bytes from filehandle"), while slurping
+# the same bytes through IO::Handle succeeds.  Every byte read in this pack
+# funnels through .slurp(:bin) on the path, so before the fix one 1048576-byte
+# file broke fs_stat and fs_list revisions outright, made fs_grep pass the
+# file over in silence (an unreadable file is skipped, never reported), handed
+# fs_read and fs_edit a bogus "not UTF-8" reason, and cost fs_map the file's
+# tags.  Both fixtures below are exactly 1048576 bytes on purpose: the one
+# size that sat on the wrong side of the boundary.  Every assertion is about
+# what the tools answer, not about Rakudo internals, so this file holds
+# whether or not Rakudo ever fixes the underlying bug.
+
+plan 8;
+
+my constant BOUNDARY = 1048576;
+
+my $sandbox = make-sandbox('slurp-boundary');
+END nuke($sandbox);
+
+my $bound = $sandbox.add('bound');
+$bound.mkdir;
+spurt-exact($bound.add('page.txt'), "alpha boundary line\n",
+	"plain padding line repeated to fill the file\n");
+spurt-exact($bound.add('big.py'), "def boundary_probe():\n",
+	"\treturn 7\n", :tail<z>);
+
+sub fs-server() {
+	my $server = MCP::Server.new(:name<fs-boundary>);
+	$server.plug: MCP::Server::Tool::FileSystem.new(:root($sandbox));
+	$server;
+}
+
+#| Spurt $first plus copies of $fill padded out to exactly BOUNDARY bytes, so
+#| every fixture here sits precisely on the size that breaks path-slurp.
+sub spurt-exact(IO::Path:D $path, Str:D $first, Str:D $fill, Str:D :$tail = 'y' --> Nil) {
+	my Int:D $fill-bytes = $fill.encode('utf-8').bytes;
+	my Int:D $left = BOUNDARY - $first.encode('utf-8').bytes;
+	my @chunks = $first;
+	while $left >= $fill-bytes {
+		@chunks.push: $fill;
+		$left -= $fill-bytes;
+	}
+	# The pad letter differs per fixture, so a grep for one file's tail is
+	# never a match inside the other's.
+	@chunks.push: $tail x $left if $left > 0;
+	$path.spurt(@chunks.join);
+	is $path.s, BOUNDARY, "{ $path.basename } is exactly the boundary size";
+}
+
+subtest 'read' => {
+	plan 3;
+	my %read = call-tool(fs-server(), 'fs_read', { path => 'bound/page.txt' });
+	nok result-errored(%read), 'A 1048576-byte file reads as text';
+	ok result-text(%read).contains('alpha boundary line'),
+		'and the whole-file answer carries the first line';
+
+	is result-text(call-tool(fs-server(), 'fs_read',
+		{ path => 'bound/page.txt', offset => 2, limit => 1 })).lines[0],
+		"2\tplain padding line repeated to fill the file",
+		'a windowed read numbers lines past the boundary too';
+};
+
+subtest 'edit' => {
+	plan 2;
+	my %edit = call-tool(fs-server(), 'fs_edit', {
+		path         => 'bound/page.txt',
+		'old-string' => 'alpha boundary line',
+		'new-string' => 'omega boundary line',
+	});
+	nok result-errored(%edit), 'A same-size edit lands inside a 1048576-byte file';
+	is result-text(%edit), "Replaced 1 occurrence in 'bound/page.txt'; wrote 1048576 bytes",
+		'and reports the byte count it wrote';
+};
+
+subtest 'stat' => {
+	plan 3;
+	my %stat = call-tool(fs-server(), 'fs_stat', { path => 'bound/page.txt' });
+	nok result-errored(%stat), 'stat digests a revision of a 1048576-byte file';
+	my %fields = result-text(%stat).lines.map({ .split(': ', 2) }).map({ .[0] => .[1] }).Hash;
+	is %fields<size>, '1048576', 'the size is reported exactly';
+	is %fields<type>, 'file', 'the type is unchanged by the size';
+};
+
+subtest 'list' => {
+	plan 2;
+	my %list = call-tool(fs-server(), 'fs_list', { path => 'bound' });
+	nok result-errored(%list), 'list digests a directory holding 1048576-byte files';
+	is-deeply result-text(%list).lines.list, ('big.py', 'page.txt'),
+		'both boundary files are listed';
+};
+
+subtest 'grep' => {
+	plan 2;
+	# Not the first line, which the edit subtest above has already rewritten:
+	# page.txt's y filler tail is the one needle nothing mutates — big.py pads
+	# with z's — so this assertion means the same whichever order the
+	# subtests run in.
+	is result-text(call-tool(fs-server(), 'fs_grep',
+		{ pattern => 'yyyy', path => 'bound' })),
+		'bound/page.txt:23303:yyyyyyyyyyy',
+		'the grep scan opens a 1048576-byte file rather than skipping it';
+	is result-text(call-tool(fs-server(), 'fs_grep',
+		{ pattern => 'def boundary_probe', path => 'bound' })),
+		'bound/big.py:1:def boundary_probe():',
+		'and finds the needle at line 1 of the big one';
+};
+
+subtest 'map' => {
+	plan 2;
+	my $text = result-text(call-tool(fs-server(), 'fs_map', { path => 'bound' }));
+	ok $text.contains('big.py'),
+		'the map reads a 1048576-byte source file instead of silently skipping it';
+	ok $text.contains('def boundary_probe'),
+		'and the definition inside it survives into the map';
+};

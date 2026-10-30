@@ -508,7 +508,7 @@ method !revision(Str:D $rel --> Hash:D) {
 		unless $path.e || $path.l;
 
 	if $path.f && !$path.l {
-		my $bytes = try $path.slurp(:bin);
+		my $bytes = try slurp-file-bytes($path);
 		die "Could not compute revision for '$rel': {error-line($!)}" without $bytes;
 		return %(
 			state => 'file',
@@ -563,7 +563,7 @@ method !revision-tree(IO::Path:D $dir, Str:D $prefix, @records is raw --> Nil) {
 			self!revision-tree($entry, $name, @records);
 		}
 		elsif $entry.f {
-			my $bytes = try $entry.slurp(:bin);
+			my $bytes = try slurp-file-bytes($entry);
 			die "Could not compute directory revision at '$name': {error-line($!)}"
 				without $bytes;
 			@records.push: 'F:' ~ $framed ~ $bytes.bytes ~ ':' ~ sha256-hex($bytes);
@@ -742,7 +742,7 @@ method !grep-files(
 			return True unless path-contains($!root, $physical);
 		}
 
-		my $bytes = try $file.slurp(:bin);
+		my $bytes = try slurp-file-bytes($file);
 		return True without $bytes;   # unreadable: skipped like an unreadable directory
 		# Binary and mis-encoded files are passed over in silence.  They used
 		# to be counted in a trailing notice, and that notice is gone: an
@@ -859,7 +859,7 @@ method !map-repo(Str:D $rel, Str:D $query, Str:D $focus, Int:D $max-chars --> St
 				next;
 			}
 
-			my $bytes = try $entry.slurp(:bin);
+			my $bytes = try slurp-file-bytes($entry);
 			without $bytes {
 				$skipped++;   # unreadable: skipped like an unreadable directory
 				next;
@@ -1375,6 +1375,27 @@ my sub decode-text(Blob:D $bytes, Str $why is rw --> Str) {
 	Str;
 }
 
+#| Read a whole file as bytes in one shot.  IO::Path.slurp(:bin) dies at
+#| exactly 1048576 bytes on Rakudo 2026.09 ("Out of range: attempted to read
+#| 0 bytes from filehandle"), while slurping the same file through its
+#| IO::Handle succeeds, so every byte read in this pack goes through the
+#| handle rather than the path.  t/12-slurp-boundary.rakutest pins the
+#| boundary from the tool side.  Read errors propagate: every call site
+#| already sits inside a try with its own unreadable-file behaviour.
+#|
+#| Deliberately one expression with no tidy-up phaser.  t/07 caught the
+#| first attempt (`my $fh = $path.open(:bin); LEAVE { try $fh.close } ...`)
+#| breaking the unreadable-file skip: a try that runs inside a LEAVE while
+#| an exception is already unwinding does not merely close the file, it
+#| swallows the in-flight failure, so the caller's own try saw no error and
+#| no value either — a VMNull with no `.defined`, in place of the clean
+#| failure the skip is written against.  slurp(:close) hands the descriptor
+#| back as soon as the read is done, and lets an open or read that dies
+#| propagate exactly the way the path form's did.
+my sub slurp-file-bytes(IO::Path:D $path --> Blob) {
+	$path.open(:bin).slurp(:close);
+}
+
 #| Read a file as text with no newline translation at all.  IO::Path.slurp in
 #| text mode silently folds CRLF into LF and .spurt never puts it back, so a
 #| file edited through it would come back with every untouched line rewritten.
@@ -1383,7 +1404,7 @@ my sub decode-text(Blob:D $bytes, Str $why is rw --> Str) {
 #| Returns an undefined Str and a reason in $why when the file cannot be read
 #| or is not UTF-8.
 my sub slurp-text(IO::Path:D $path, Str $why is rw --> Str) {
-	my $bytes = try $path.slurp(:bin);
+	my $bytes = try slurp-file-bytes($path);
 	without $bytes {
 		$why = error-line($!);
 		return Str;
