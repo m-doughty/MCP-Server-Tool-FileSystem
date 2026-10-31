@@ -2,6 +2,12 @@ Revision history for MCP::Server::Tool::FileSystem
 
 {{$NEXT}}
 
+0.3.3  2026-10-31T19:00:55Z
+    - MAINT: [2026-10-31] Compare revision test paths with native lexical
+      path rules. Mixed Windows separators now reach the intended
+      injected faults. Pin Windows spellings and POSIX backslash handling
+      in a regression that runs on every host.
+
 0.3.2  2026-10-31T18:30:48Z
     - MAINT: [2026-10-31] Make the revision-failure regression portable
       across supported compilers. It tests the result boundary with real
