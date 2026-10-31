@@ -5,7 +5,7 @@ use MCP::Server;
 use MCP::Server::Tool::FileSystem;
 use MCP::Server::Tool::FileSystem::Test::Kit;
 
-plan 7;
+plan 8;
 
 sub fixture(Str:D $tag --> Hash:D) {
 	my $root = make-sandbox("revision-failure-$tag");
@@ -22,16 +22,22 @@ sub make-tree(IO::Path:D $root, Str:D $name --> IO::Path:D) {
 	$deep;
 }
 
+# Traversal and multi-component adds can spell Windows separators differently.
+# Use the path's lexical rules without resolving links or requiring existence.
+sub fixture-path-key(IO::Path:D $path --> Str:D) {
+	$path.SPEC.canonpath($path.Str);
+}
+
 # Scope a failed open to one real entry in the revision traversal. The tools'
 # action paths still use ordinary IO::Path objects, so a move really renames
 # the directory before its destination revision encounters this failure.
 sub unreadable-entry($kit, Str:D $directory, Str:D $leaf --> Hash:D) {
-	my $target = $kit.root.add($directory).Str;
+	my $target = fixture-path-key($kit.root.add($directory));
 	my $faults = 0;
 	my $method = MCP::Server::Tool::FileSystem.^find_private_method('revision-tree');
 	my $wrapper = $method.wrap(-> $self, IO::Path:D $dir, Str:D $prefix,
 		@records is raw, *%named {
-		if $self === $kit && $dir.Str eq $target {
+		if $self === $kit && fixture-path-key($dir) eq $target {
 			my $unreadable = $dir but role {
 				method dir(|capture) {
 					my @entries = callsame;
@@ -60,12 +66,12 @@ sub unreadable-entry($kit, Str:D $directory, Str:D $leaf --> Hash:D) {
 }
 
 sub unreadable-directory($kit, Str:D $directory --> Hash:D) {
-	my $target = $kit.root.add($directory).Str;
+	my $target = fixture-path-key($kit.root.add($directory));
 	my $faults = 0;
 	my $method = MCP::Server::Tool::FileSystem.^find_private_method('revision-tree');
 	my $wrapper = $method.wrap(-> $self, IO::Path:D $dir, Str:D $prefix,
 		@records is raw, *%named {
-		if $self === $kit && $dir.Str eq $target {
+		if $self === $kit && fixture-path-key($dir) eq $target {
 			my $unreadable = $dir but role {
 				method dir(|capture) {
 					$faults++;
@@ -236,4 +242,30 @@ subtest 'successful byte and tree revision tokens remain unchanged' => {
 		"sha256-v1:directory:$tree-digest", 'the requested path is not hashed into the tree token';
 	is-deeply %move<result><structuredContent><revisions><from>,
 		{ state => 'absent', token => 'sha256-v1:absent' }, 'the absent token remains unchanged';
+};
+
+subtest 'fault fixture paths use their own platform separator rules' => {
+	plan 7;
+	my sub win(Str:D $path --> IO::Path:D) {
+		IO::Path.new($path, :SPEC(IO::Spec::Win32));
+	}
+	my $root = win('c:/fixture');
+	my $mixed = $root.add('target/nested/deep');
+	my $native = $root.add('target').add('nested').add('deep');
+
+	is fixture-path-key($mixed), fixture-path-key($native),
+		'a slash-separated target matches component-wise Windows traversal';
+	is fixture-path-key(win(Q[c:\fixture\target\.\nested/deep])), fixture-path-key($native),
+		'dot components and mixed separators identify the same Windows path';
+	is fixture-path-key(win('C:/fixture/target/nested/deep')), fixture-path-key($native),
+		'Windows drive-letter spelling is canonical';
+	isnt fixture-path-key(win('C:/fixture/target/nested/other')), fixture-path-key($native),
+		'a different leaf does not match';
+	isnt fixture-path-key(win('D:/fixture/target/nested/deep')), fixture-path-key($native),
+		'a different drive does not match';
+	isnt fixture-path-key(win('C:/fixture/TARGET/nested/deep')), fixture-path-key($native),
+		'non-drive components retain their spelling';
+	isnt fixture-path-key(IO::Path.new(Q[/fixture/target\nested], :SPEC(IO::Spec::Unix))),
+		fixture-path-key(IO::Path.new('/fixture/target/nested', :SPEC(IO::Spec::Unix))),
+		'a POSIX backslash remains part of its filename';
 };
