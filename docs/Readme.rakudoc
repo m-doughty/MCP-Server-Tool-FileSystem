@@ -164,6 +164,22 @@ C<directory>, or C<symlink> with an opaque token. File tokens hash exact bytes;
 directory tokens hash a canonical, path-sorted recursive tree description, so
 a descendant change changes the directory revision.
 
+Directory coverage includes every descendant, including C<.git>, C<node_modules>
+and C<.precomp>. Revision hashing reuses two 64 KiB buffers across each traversal.
+Each toolkit instance retains at most 8192 file digests for reuse.
+This bounds memo storage, without limiting traversal or changing token values.
+Reuse requires matching identity, size, modification time and change time.
+Metadata must remain stable across hashing, with both timestamps over two seconds old.
+Recent files must be read again after that window before reuse becomes possible.
+A backward clock adjustment clears the memo.
+
+Observational reuse assumes the filesystem reports ordinary completed writes through
+its change time. Same-size writes with restored modification times are detected.
+Filesystems or writers suppressing change-time updates cannot guarantee fresh
+observational digests. Conditional mutations always hash fresh bytes before comparing
+tokens, even when a memo entry exists. Mutations invalidate affected memo entries
+before changing files.
+
 If revision calculation fails after an action succeeds, its text still returns.
 The affected location has C<state = unknown> and no token.
 Other locations retain their successfully computed revisions.
@@ -828,7 +844,7 @@ Residual risks worth knowing:
 =item C<delete> with C<recursive> is C<rm -rf>, applied to a path the model chose. It refuses the root itself and it unlinks symlinks rather than following them, but within the root it is exactly as final as it sounds. This is the tool to gate behind a permission layer first.
 =item C<move> is a rename and only a rename. If the root spans a mount point — a bind mount, a network share grafted into the tree — a move across it fails with the OS's own error instead of silently copying and deleting. Honest, but it means such a move is simply not available; do it with C<read> and C<write> if you must.
 =item Conditional revisions are authoritative among calls through one toolkit instance. An unrelated process writing the same filesystem does not take this lock, so it can still race between the toolkit's comparison and operating-system mutation. Its completed changes are detected by the next comparison; it does not participate atomically.
-=item Nothing here rate-limits or size-limits: C<read> will happily slurp a huge file into memory, C<glob> will walk a huge tree, and C<grep> walks the whole tree below the path it is given — opening every text file in it when no external searcher is installed, and only the files one named when there is (C<max-results> bounds the I<output>, not the walking). C<map> is the one exception — it prunes, skips files over 1MB, stops after 5000 files and bounds its own output — but its first pass over a large tree still costs a parse of every source file in it. Point the pack at a workspace, not at C</>.
+=item Revision hashing reuses bounded file buffers and bounds its digest memo, but still traverses the complete tree. Other tools have no general rate or size limit: C<read> will happily slurp a huge file into memory, C<glob> will walk a huge tree, and C<grep> walks the whole tree below the path it is given — opening every text file in it when no external searcher is installed, and only the files one named when there is (C<max-results> bounds the I<output>, not the walking). C<map> prunes, skips files over 1MB, stops after 5000 files and bounds its own output, but its first pass over a large tree still costs a parse of every source file in it. Point the pack at a workspace, not at C</>.
 
 =head2 Resolving a path the way the OS will
 

@@ -1,0 +1,484 @@
+use Test;
+use lib 'lib';
+use Digest::SHA256::Native;
+use MCP::Server;
+use MCP::Server::Tool::FileSystem;
+use MCP::Server::Tool::FileSystem::Test::Kit;
+use MCP::Server::Tool::FileSystem::Test::FileTimeFixture;
+use nqp;
+
+# These seams are installed before any observations. Each control is scoped
+# to one instance; all other instances retain the actual clock and metadata.
+my %clocks;
+my %stat-overrides;
+my $clock-method = MCP::Server::Tool::FileSystem.^find_private_method('revision-clock');
+my $clock-wrapper = $clock-method.wrap(-> $self {
+	(%clocks{$self.WHICH}:exists) ?? %clocks{$self.WHICH} !! callsame;
+});
+my $stat-method = MCP::Server::Tool::FileSystem.^find_private_method('revision-stat');
+my $stat-wrapper = $stat-method.wrap(-> $self, IO::Path:D $path {
+	my $actual = callsame;
+	(%stat-overrides{$self.WHICH}:exists)
+		?? %stat-overrides{$self.WHICH}($path, $actual) !! $actual;
+});
+END {
+	$clock-method.unwrap($clock-wrapper) if $clock-wrapper.defined;
+	$stat-method.unwrap($stat-wrapper) if $stat-wrapper.defined;
+}
+
+sub fixture(Str:D $tag --> Hash:D) {
+	my $root = make-sandbox("revision-cache-$tag");
+	my $kit = MCP::Server::Tool::FileSystem.new(:$root);
+	my $server = MCP::Server.new(:name<revision-cache>);
+	$server.plug: $kit;
+	%( root => $kit.root, :$kit, :$server );
+}
+
+# Install before the first observation, including on stock private dispatch.
+sub counted-files($kit --> Hash:D) {
+	my $opens = 0;
+	my $closes = 0;
+	my @reads;
+	my @buffers;
+	my @handles;
+	my $fault = '';
+	my $method = MCP::Server::Tool::FileSystem.^find_private_method('revision-open');
+	my $wrapper = $method.wrap(-> $self, IO::Path:D $path {
+		if $self === $kit {
+			$opens++;
+			my $handle = callsame;
+			my $requests = 0;
+			my $tracked = $handle but role {
+				method read(|capture) {
+					@reads.push: capture[0];
+					$requests++;
+					die 'synthetic streaming read failure'
+						if $fault.starts-with('read')
+							&& (!$fault.contains('late') || $requests >= 3);
+					my $result = callsame;
+					@buffers.push: $result.WHICH.Str;
+					$result;
+				}
+				method tell(|capture) {
+					die 'synthetic streaming tell failure' if $fault.starts-with('tell');
+					callsame;
+				}
+				method close(|capture) {
+					$closes++;
+					my $result = callsame;
+					die 'secondary close failure' if $fault.ends-with('close');
+					$result;
+				}
+			};
+			@handles.push: $tracked;
+			$tracked;
+		}
+		else { callsame }
+	});
+	%(
+		restore => -> { $method.unwrap($wrapper) }, opens => -> { $opens },
+		closes => -> { $closes }, reads => -> { @reads.List },
+		buffers => -> { @buffers.List },
+		handles => -> { @handles.List }, fault => -> $value { $fault = $value },
+	);
+}
+
+sub token(%response --> Str:D) {
+	%response<result><structuredContent><revisions><path><token>
+		// die "Expected a usable revision token, got {%response.raku}";
+}
+
+sub observe(%f, Str:D $path = 'tree' --> Hash:D) {
+	call-tool(%f<server>, 'fs_list', { :$path });
+}
+
+sub cache($kit --> Hash:D) {
+	MCP::Server::Tool::FileSystem.^attributes.first(*.name eq '%!revision-cache').get_value($kit);
+}
+
+sub admission-count($kit --> Int:D) {
+	MCP::Server::Tool::FileSystem.^attributes
+		.first(*.name eq '@!revision-cache-order').get_value($kit).elems;
+}
+
+sub mature($kit --> Nil) {
+	%clocks{$kit.WHICH} = nqp::time() + 10_000_000_000;
+}
+
+sub fixture-file(%f, Str:D $text = 'old bytes' --> IO::Path:D) {
+	%f<root>.add('tree').mkdir;
+	my $file = %f<root>.add('tree').add('file.txt');
+	$file.spurt($text);
+	$file;
+}
+
+subtest 'an unchanged mature tree reuses file digests' => {
+	plan 8;
+	my %f = fixture('warm');
+	LEAVE nuke(%f<root>);
+	%f<root>.add('tree').mkdir;
+	%f<root>.add('tree').add('file.txt').spurt('stable bytes');
+	my %count = counted-files(%f<kit>);
+	LEAVE { %count<restore>() if %count<restore>.defined }
+	# Both the change time and modification time must leave the racy window.
+	sleep 2.2;
+	my %first = call-tool(%f<server>, 'fs_list', { path => 'tree' });
+	nok result-errored(%first), 'the first observation succeeds';
+	is %first<result><structuredContent><revisions><path><state>, 'directory',
+		'the first observation has a usable directory revision';
+	is %count<opens>(), 1, 'the first observation actually hashes the file';
+	my %second = call-tool(%f<server>, 'fs_list', { path => 'tree' });
+	nok result-errored(%second), 'the repeated observation succeeds';
+	is %second<result><structuredContent><revisions><path><state>, 'directory',
+		'the repeated observation has a usable directory revision';
+	is token(%second), token(%first), 'the exact revision token is unchanged';
+	is %count<opens>(), 1, 'the repeated revision opens no files';
+	is result-text(%second), result-text(%first), 'the list text is unchanged';
+};
+
+subtest 'streaming preserves legacy canonical tokens and bounds reads' => {
+	plan 12;
+	my %f = fixture('framing');
+	LEAVE nuke(%f<root>);
+	%f<root>.add('tree').mkdir;
+	my @records;
+	my %bytes = empty => Blob.new, binary => Blob.new(0..255),
+		before => ('b' x 65535).encode, boundary => ('c' x 65536).encode,
+		after => ('d' x 65537).encode, mib => ('e' x 1048576).encode;
+	for %bytes.keys.sort -> $name {
+		%f<root>.add('tree').add($name).spurt(%bytes{$name}, :bin);
+		@records.push: 'F:' ~ $name.encode.bytes ~ ':' ~ $name ~ ':'
+			~ %bytes{$name}.bytes ~ ':' ~ sha256-hex(%bytes{$name});
+	}
+	my %count = counted-files(%f<kit>);
+	LEAVE { %count<restore>() if %count<restore>.defined }
+	my %result = observe(%f);
+	nok result-errored(%result), 'empty, binary, chunk boundaries and exactly 1 MiB list';
+	is token(%result), 'sha256-v1:directory:' ~ sha256-hex(@records.sort.join.encode),
+		'the directory token equals the legacy full-byte framing';
+	for %bytes.keys.sort -> $name {
+		my %stat = call-tool(%f<server>, 'fs_stat', { path => "tree/$name" });
+		is token(%stat), 'sha256-v1:file:' ~ sha256-hex(%bytes{$name}),
+			"$name retains its legacy exact-byte file token";
+	}
+	is %count<opens>(), 12, 'every tree and direct-file revision was really streamed';
+	is %count<closes>(), 12, 'each streamed reader was closed';
+	ok %count<reads>().elems > 6, 'large files were read incrementally';
+	ok %count<reads>().all == 65536, 'every streaming request is bounded to 64 KiB';
+};
+
+subtest 'one revision reuses at most two buffers across chunks and files' => {
+	plan 4;
+	my %f = fixture('buffer-reuse');
+	LEAVE nuke(%f<root>);
+	%f<root>.add('tree').mkdir;
+	my @records;
+	for <a b c> -> $name {
+		my $bytes = ($name x 131073).encode;
+		%f<root>.add('tree').add($name).spurt($bytes, :bin);
+		@records.push: 'F:1:' ~ $name ~ ':131073:' ~ sha256-hex($bytes);
+	}
+	my %count = counted-files(%f<kit>);
+	LEAVE { %count<restore>() if %count<restore>.defined }
+	my %result = observe(%f);
+	is token(%result), 'sha256-v1:directory:' ~ sha256-hex(@records.sort.join.encode),
+		'buffer lifetime and reuse retain the exact full tree digest';
+	is %count<opens>(), 3, 'all three files were hashed';
+	is %count<reads>().elems, 12, 'all chunks and EOF reads actually ran';
+	is %count<buffers>().unique.elems, 2,
+		'only two buffer identities serve every file in this revision';
+};
+
+subtest 'streaming failures close handles and preserve successful action text' => {
+	plan 33;
+	for <read read-late tell> -> $fault {
+		my %f = fixture("failure-$fault");
+		LEAVE nuke(%f<root>);
+		fixture-file(%f, 'x' x 200000);
+		my %count = counted-files(%f<kit>);
+		LEAVE { %count<restore>() if %count<restore>.defined }
+		%count<fault>($fault);
+		my %result = observe(%f);
+		nok result-errored(%result), "$fault failure preserves completed list success";
+		like result-text(%result), /'file.txt'/, "$fault failure preserves list text";
+		is-deeply %result<result><structuredContent><revisions><path>,
+			{ state => 'unknown' }, "$fault failure yields unknown without token";
+		is %count<opens>(), 1, "$fault fault really opens a file";
+		is %count<closes>(), 1, "$fault failure closes the owned handle";
+		nok %count<handles>()[0].opened, "$fault leaves the original handle closed";
+		%count<fault>("{$fault}-close");
+		my %conditional = call-tool(%f<server>, 'fs_delete', {
+			path => 'tree', recursive => True,
+			'_expected-revisions' => { path => 'unused-token' },
+		});
+		ok result-errored(%conditional), "$fault failure rejects the conditional action";
+		my $kind = $fault.starts-with('read') ?? 'read' !! 'tell';
+		like result-text(%conditional), /"synthetic streaming $kind failure"/,
+			"$fault retains the original error despite a secondary close failure";
+		is %count<closes>(), 2, "$fault comparison closes its owned handle";
+		nok %count<handles>()[1].opened, "$fault comparison leaves its handle closed";
+		ok %f<root>.add('tree').add('file.txt').e, "$fault comparison does not mutate";
+	}
+};
+
+subtest 'the time guard checks both timestamps at its exact boundary' => {
+	plan 5;
+	my %f = fixture('guard');
+	LEAVE nuke(%f<root>);
+	my $old = MCP::Server::Tool::FileSystem.^find_private_method('revision-old');
+	my $clock = 10_000_000_000;
+	nok $old(%f<kit>, (1, 1, 1, 0, 8_000_000_000, 7_000_000_000), $clock),
+		'an mtime exactly at the two-second boundary is racy';
+	nok $old(%f<kit>, (1, 1, 1, 0, 7_000_000_000, 8_000_000_000), $clock),
+		'a ctime exactly at the two-second boundary is racy';
+	ok $old(%f<kit>, (1, 1, 1, 0, 7_999_999_999, 7_999_999_999), $clock),
+		'both timestamps strictly older than the guard qualify';
+	nok $old(%f<kit>, (1, 1, 1, 0, 11_000_000_000, 7_000_000_000), $clock),
+		'a future mtime cannot qualify';
+	nok $old(%f<kit>, (1, 1, 1, 0, 7_000_000_000, 11_000_000_000), $clock),
+		'a future ctime cannot qualify';
+};
+
+subtest 'directory framing uses bytes actually read rather than stat size' => {
+	plan 4;
+	my %f = fixture('byte-count');
+	LEAVE nuke(%f<root>);
+	fixture-file(%f, 'actual bytes');
+	mature(%f<kit>);
+	%stat-overrides{%f<kit>.WHICH} = -> $path, $actual {
+		my @copy = $actual;
+		@copy[3] += 123;
+		@copy.List;
+	};
+	my %count = counted-files(%f<kit>);
+	LEAVE { %count<restore>() if %count<restore>.defined }
+	my $record = 'F:8:file.txt:12:' ~ sha256-hex('actual bytes');
+	my $expected = 'sha256-v1:directory:' ~ sha256-hex($record.encode);
+	is token(observe(%f)), $expected, 'stat size never becomes the framed content byte count';
+	is cache(%f<kit>).elems, 0, 'inconsistent stat size prevents admission';
+	is token(observe(%f)), $expected, 'the repeated token still hashes actual bytes';
+	is %count<opens>(), 2, 'inconsistent size observations always read again';
+};
+
+subtest 'a recent digest must be read again after its timestamps mature' => {
+	plan 6;
+	my %f = fixture('racy');
+	LEAVE nuke(%f<root>);
+	my $file = fixture-file(%f);
+	my $metadata = $stat-method(%f<kit>, $file);
+	%clocks{%f<kit>.WHICH} = max($metadata[4], $metadata[5]) + 1_000_000_000;
+	my %count = counted-files(%f<kit>);
+	LEAVE { %count<restore>() if %count<restore>.defined }
+	my %first = observe(%f);
+	is %count<opens>(), 1, 'a racy file is read';
+	is cache(%f<kit>).elems, 0, 'a racy digest is not admitted';
+	%clocks{%f<kit>.WHICH} += 2_000_000_000;
+	my %second = observe(%f);
+	is %count<opens>(), 2, 'waiting alone does not turn the old digest into a cache hit';
+	is cache(%f<kit>).elems, 1, 'a new stable mature read is admitted';
+	is token(observe(%f)), token(%first), 'mature reuse preserves the content token';
+	is %count<opens>(), 2, 'the next mature observation performs no read';
+};
+
+subtest 'future and unusable metadata cannot justify reuse' => {
+	plan 5;
+	my %f = fixture('future');
+	LEAVE nuke(%f<root>);
+	my $file = fixture-file(%f);
+	set-file-mtime($file, Instant.from-posix(now.to-posix.head + 3600));
+	my %count = counted-files(%f<kit>);
+	LEAVE { %count<restore>() if %count<restore>.defined }
+	my $original = token(observe(%f));
+	is token(observe(%f)), $original, 'a future mtime leaves token framing unchanged';
+	is %count<opens>(), 2, 'future timestamp observations both read';
+	is cache(%f<kit>).elems, 0, 'future timestamps are never admitted';
+	%stat-overrides{%f<kit>.WHICH} = -> $path, $actual { List };
+	is token(observe(%f)), $original, 'unusable metadata still allows exact hashing';
+	is %count<opens>(), 3, 'unusable metadata requires another actual read';
+};
+
+subtest 'unstable snapshots and rollback invalidate reuse' => {
+	plan 7;
+	my %f = fixture('unstable');
+	LEAVE nuke(%f<root>);
+	fixture-file(%f);
+	mature(%f<kit>);
+	my $snapshots = 0;
+	%stat-overrides{%f<kit>.WHICH} = -> $path, $actual {
+		my @copy = $actual;
+		@copy[5] += ++$snapshots;
+		@copy.List;
+	};
+	my %count = counted-files(%f<kit>);
+	LEAVE { %count<restore>() if %count<restore>.defined }
+	my $original = token(observe(%f));
+	is $snapshots, 2, 'hashing samples metadata before and after';
+	is cache(%f<kit>).elems, 0, 'a changing snapshot is not admitted';
+	%stat-overrides{%f<kit>.WHICH}:delete;
+	is token(observe(%f)), $original, 'a stable second read preserves the token';
+	is %count<opens>(), 2, 'the stable read was not reused from the unstable one';
+	is cache(%f<kit>).elems, 1, 'the stable read warms the memo';
+	%clocks{%f<kit>.WHICH} -= 1;
+	is token(observe(%f)), $original, 'a backward clock preserves content hashing';
+	is %count<opens>(), 3, 'clock rollback clears the old memo before lookup';
+};
+
+subtest 'same-size restored-mtime edits reject stale recursive mutations' => {
+	plan 10;
+	my %f = fixture('restored');
+	LEAVE nuke(%f<root>);
+	my $file = fixture-file(%f, 'before');
+	my $mtime = Instant.from-posix(now.to-posix.head - 30);
+	set-file-mtime($file, $mtime);
+	mature(%f<kit>);
+	my $before = token(observe(%f));
+	is cache(%f<kit>).elems, 1, 'the original bytes have a memo entry';
+	$file.spurt('after!');
+	set-file-mtime($file, $mtime);
+	is $file.s, 6, 'the replacement has the same size';
+	is $stat-method(%f<kit>, $file)[4], $mtime.to-posix.head.floor * 1_000_000_000,
+		'the replacement has the restored modification time';
+	my $after = token(observe(%f));
+	isnt $after, $before, 'the change time exposes the changed bytes';
+	my %deleted = call-tool(%f<server>, 'fs_delete', {
+		path => 'tree', recursive => True, '_expected-revisions' => { path => $before },
+	});
+	ok result-errored(%deleted), 'recursive delete rejects the stale tree token';
+	ok $file.e, 'the rejected delete leaves the descendant present';
+	my %moved = call-tool(%f<server>, 'fs_move', {
+		from => 'tree', to => 'target', '_expected-revisions' => {
+			from => $before, to => 'sha256-v1:absent',
+		},
+	});
+	ok result-errored(%moved), 'recursive move rejects the stale tree token';
+	ok $file.e, 'the rejected move leaves the source present';
+	nok %f<root>.add('target').e, 'the rejected move creates no destination';
+	is $file.slurp, 'after!', 'both rejected mutations preserve the changed bytes';
+};
+
+subtest 'fresh comparisons bypass an apparently unchanged memo' => {
+	plan 7;
+	my %f = fixture('fresh');
+	LEAVE nuke(%f<root>);
+	my $file = fixture-file(%f, 'before');
+	mature(%f<kit>);
+	my $frozen = $stat-method(%f<kit>, $file);
+	%stat-overrides{%f<kit>.WHICH} = -> $path, $actual { $frozen };
+	my %count = counted-files(%f<kit>);
+	LEAVE { %count<restore>() if %count<restore>.defined }
+	my $before = token(observe(%f));
+	$file.spurt('after!');
+	is token(observe(%f)), $before, 'suppressed metadata demonstrates the observational limitation';
+	is %count<opens>(), 1, 'the observational memo really was used';
+	my %result = call-tool(%f<server>, 'fs_delete', {
+		path => 'tree', recursive => True, '_expected-revisions' => { path => $before },
+	});
+	ok result-errored(%result), 'fresh comparison rejects changed bytes despite frozen metadata';
+	is %count<opens>(), 2, 'the comparison really reopens the file';
+	like result-text(%result), /'Stale filesystem observation'/, 'the rejection is a stale comparison';
+	ok $file.e, 'the file survives the rejected deletion';
+	is $file.slurp, 'after!', 'the new bytes survive';
+};
+
+subtest 'successful mutation invalidates descendants and preserves sibling entries' => {
+	plan 7;
+	my %f = fixture('invalidate');
+	LEAVE nuke(%f<root>);
+	my $file = fixture-file(%f, 'before');
+	%f<root>.add('tree2').mkdir;
+	%f<root>.add('tree2').add('file.txt').spurt('sibling');
+	mature(%f<kit>);
+	my $frozen = $stat-method(%f<kit>, $file);
+	%stat-overrides{%f<kit>.WHICH} = -> $path, $actual {
+		$path.SPEC.canonpath($path.absolute) eq $file.SPEC.canonpath($file.absolute)
+			?? $frozen !! $actual;
+	};
+	my %count = counted-files(%f<kit>);
+	LEAVE { %count<restore>() if %count<restore>.defined }
+	my $before = token(observe(%f));
+	my $sibling = token(observe(%f, 'tree2'));
+	is cache(%f<kit>).elems, 2, 'both component-distinct trees are cached';
+	my %result = call-tool(%f<server>, 'fs_write', {
+		path => 'tree/file.txt', content => 'after!',
+	});
+	nok result-errored(%result), 'the real write succeeds';
+	is token(%result), 'sha256-v1:file:' ~ sha256-hex('after!'),
+		'the post-write token is fresh despite frozen metadata';
+	isnt token(observe(%f)), $before, 'the parent tree reflects changed bytes';
+	my $opens = %count<opens>();
+	is token(observe(%f, 'tree2')), $sibling, 'the sibling token remains intact';
+	is %count<opens>(), $opens, 'component-prefix sibling entries are retained';
+	is cache(%f<kit>).elems, 2, 'mutation does not discard the whole memo';
+};
+
+subtest 'all pruned-name descendants remain covered' => {
+	plan 4;
+	my %f = fixture('coverage');
+	LEAVE nuke(%f<root>);
+	%f<root>.add('tree').mkdir;
+	for <.git node_modules .precomp> -> $name {
+		%f<root>.add('tree').add($name).mkdir;
+		%f<root>.add('tree').add($name).add('file').spurt('before');
+	}
+	mature(%f<kit>);
+	my $previous = token(observe(%f));
+	is cache(%f<kit>).elems, 3, 'all three normally pruned names were hashed';
+	for <.git node_modules .precomp> -> $name {
+		%f<root>.add('tree').add($name).add('file').spurt('after!');
+		my $next = token(observe(%f));
+		isnt $next, $previous, "changes inside $name change the complete tree token";
+		$previous = $next;
+	}
+};
+
+subtest 'replacement identity and separate instances cannot reuse stale digests' => {
+	plan 5;
+	my %f = fixture('identity');
+	LEAVE nuke(%f<root>);
+	my $file = fixture-file(%f, 'before');
+	mature(%f<kit>);
+	my %count = counted-files(%f<kit>);
+	LEAVE { %count<restore>() if %count<restore>.defined }
+	my $before = token(observe(%f));
+	my $replacement = %f<root>.add('replacement');
+	$replacement.spurt('after!');
+	$replacement.rename($file);
+	isnt token(observe(%f)), $before, 'a same-size atomic replacement changes the token';
+	is %count<opens>(), 2, 'the replacement is actually read';
+	my $other = MCP::Server::Tool::FileSystem.new(root => %f<root>);
+	my $server = MCP::Server.new(:name<other-instance>);
+	$server.plug: $other;
+	mature($other);
+	my %other-count = counted-files($other);
+	LEAVE { %other-count<restore>() if %other-count<restore>.defined }
+	is cache($other).elems, 0, 'a second instance starts with no inherited memo';
+	my %result = call-tool($server, 'fs_list', { path => 'tree' });
+	is %other-count<opens>(), 1, 'the second instance reads its own bytes';
+	is token(%result), token(observe(%f)), 'both instances report the same content token';
+};
+
+subtest 'memo entries and historical admission records are bounded' => {
+	plan 7;
+	my %f = fixture('bounded');
+	LEAVE nuke(%f<root>);
+	my $file = fixture-file(%f);
+	mature(%f<kit>);
+	observe(%f);
+	my $entry = cache(%f<kit>).values.head;
+	my $remember = MCP::Server::Tool::FileSystem.^find_private_method('remember-revision');
+	# Exercise admission directly without thousands of unrelated disk fixtures.
+	for ^8300 -> $i { $remember(%f<kit>, %f<root>.add("historical-$i").Str, $entry.clone) }
+	is cache(%f<kit>).elems, 8192, 'the memo never keeps more than 8192 file digests';
+	nok cache(%f<kit>){$file.SPEC.canonpath($file.absolute)}:exists,
+		'the oldest entry is evicted';
+	ok cache(%f<kit>){%f<root>.add('historical-8299').Str}:exists,
+		'the most recent admission survives';
+	for ^17000 -> $i { $remember(%f<kit>, %f<root>.add('replacement-key').Str, $entry.clone) }
+	is cache(%f<kit>).elems, 8192, 'repeated replacement does not grow memo storage';
+	ok admission-count(%f<kit>) <= 16384, 'stale admission records are compacted';
+	my $result = observe(%f);
+	ok token($result).starts-with('sha256-v1:directory:'), 'eviction retains full revision coverage';
+	is cache(%f<kit>).elems, 8192, 'rehashing an evicted file respects the same cap';
+};
+
+done-testing;

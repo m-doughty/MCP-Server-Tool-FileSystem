@@ -1,5 +1,5 @@
 use MCP::Server::Toolkit;
-use Digest::SHA256::Native;
+use Digest::SHA256::Native:ver<1.0.2+>;
 
 # For nqp::readlink in physical-path below.  Rakudo has no public readlink,
 # and IO::Path.resolve — the obvious alternative — is documented not to
@@ -57,8 +57,55 @@ has Lock $!mutation-lock .= new;
 has %!map-cache;
 has Lock $!map-lock .= new;
 
+# Accessed only under the mutation lock, including observational revisions.
+has %!revision-cache;
+has @!revision-cache-order;
+has Int $!revision-last-clock;
+
 my constant REVISION-SCHEME = 'sha256-v1';
 my constant EXPECTED-REVISIONS = '_expected-revisions';
+my constant REVISION-CACHE-LIMIT = 8192;
+my constant REVISION-TIME-GUARD = 2_000_000_000;
+
+my class RevisionDigest {
+	has List:D $.stat is required;
+	has Str:D $.digest is required;
+	has Int:D $.bytes is required;
+}
+
+# IO::Handle.read allocates a new buffer on every call. Its external storage
+# can accumulate until GC, even when only one chunk is logically live.
+# NQP's documented readfh reuses the supplied buffer and frees its old slots.
+my class RevisionReader {
+	has Mu $!handle;
+	has Bool:D $.opened = False;
+
+	submethod BUILD(IO::Path:D :$path!) {
+		$!handle := nqp::open(nqp::decont_s($path.absolute), 'r');
+		$!opened = True;
+	}
+
+	method read(Int:D $bytes, buf8:D :$buf! --> buf8:D) {
+		die 'Cannot read a closed revision reader' unless $!opened;
+		nqp::readfh($!handle, nqp::decont($buf), nqp::unbox_i($bytes));
+		$buf;
+	}
+
+	method tell(--> Int:D) { nqp::tellfh($!handle) }
+
+	method close(--> Nil) {
+		if $!opened {
+			$!opened = False;
+			nqp::closefh($!handle);
+		}
+	}
+}
+
+# Shared by descendant file hashes within one revision, never between calls.
+my class RevisionBuffers {
+	has buf8:D $.first .= new;
+	has buf8:D $.second .= new;
+}
 
 # The lock the scanning phase of every grep runs under, whichever tier chose
 # the files it looks at.  Module-level rather than per-instance, and declared
@@ -471,7 +518,7 @@ method !mutation-result(%args, @locations, &action --> Hash:D) {
 		if $conditional {
 			my %expected = $raw.Hash;
 			for @locations -> $location {
-				my %current = self!revision($location.value.Str);
+				my %current = self!revision($location.value.Str, :fresh);
 				next if %current<token> eq %expected{$location.key};
 				die "Stale filesystem observation for '{$location.value}': "
 					~ "the expected revision no longer matches. Re-read or stat the path, "
@@ -479,6 +526,9 @@ method !mutation-result(%args, @locations, &action --> Hash:D) {
 			}
 		}
 
+		# A fresh comparison can populate the memo with pre-action bytes.
+		# Remove those entries before an action changes these paths.
+		self!invalidate-revisions(@locations);
 		my $text = action();
 		self!tool-result($text, @locations);
 	}
@@ -505,27 +555,28 @@ method !tool-result(Str:D $text, @locations --> Hash:D) {
 	);
 }
 
-# A revision is about bytes and tree identity, never mtimes.  Directory input
-# is a length-framed, path-sorted list so neither traversal order nor ambiguous
-# separators can change the digest.  Symlinks are recorded as links and are not
-# followed, matching the recursive tool safety policy.
-method !revision(Str:D $rel --> Hash:D) {
+# Tokens contain only bytes and tree identity. Stable, sufficiently old file
+# metadata can reuse an observational digest; conditional comparisons always
+# hash fresh bytes. Directory traversal remains complete and length-framed.
+# Symlinks are recorded as links, never followed.
+method !revision(Str:D $rel, Bool:D :$fresh = False --> Hash:D) {
 	my $path = self!resolve($rel);
 	return %( state => 'absent', token => REVISION-SCHEME ~ ':absent' )
 		unless $path.e || $path.l;
+	my $buffers = RevisionBuffers.new;
 
 	if $path.f && !$path.l {
-		my $bytes = try slurp-file-bytes($path);
-		die "Could not compute revision for '$rel': {error-line($!)}" without $bytes;
+		my $file = try self!revision-file($path, :$fresh, :$buffers);
+		die "Could not compute revision for '$rel': {error-line($!)}" without $file;
 		return %(
 			state => 'file',
-			token => REVISION-SCHEME ~ ':file:' ~ sha256-hex($bytes),
+			token => REVISION-SCHEME ~ ':file:' ~ $file<digest>,
 		);
 	}
 
 	if $path.d && !$path.l {
 		my @records;
-		self!revision-tree($path, '', @records, root-rel => $rel);
+		self!revision-tree($path, '', @records, root-rel => $rel, :$fresh, :$buffers);
 		return %(
 			state => 'directory',
 			token => REVISION-SCHEME ~ ':directory:'
@@ -553,7 +604,8 @@ method !revision(Str:D $rel --> Hash:D) {
 
 method !revision-tree(
 	IO::Path:D $dir, Str:D $prefix, @records is raw,
-	Str:D :$root-rel! --> Nil
+	Str:D :$root-rel!, Bool:D :$fresh = False,
+	RevisionBuffers:D :$buffers = RevisionBuffers.new --> Nil
 ) {
 	my $relative-dir = $prefix.chars
 		?? ($root-rel eq '.' ?? $prefix !! "$root-rel/$prefix")
@@ -574,18 +626,143 @@ method !revision-tree(
 		}
 		elsif $entry.d {
 			@records.push: 'D:' ~ $framed;
-			self!revision-tree($entry, $name, @records, :$root-rel);
+			self!revision-tree($entry, $name, @records, :$root-rel, :$fresh, :$buffers);
 		}
 		elsif $entry.f {
-			my $bytes = try slurp-file-bytes($entry);
+			my $file = try self!revision-file($entry, :$fresh, :$buffers);
 			die "Could not compute directory revision at '$relative-name': {error-line($!)}"
-				without $bytes;
-			@records.push: 'F:' ~ $framed ~ $bytes.bytes ~ ':' ~ sha256-hex($bytes);
+				without $file;
+			@records.push: 'F:' ~ $framed ~ $file<bytes> ~ ':' ~ $file<digest>;
 		}
 		else {
 			@records.push: 'O:' ~ $framed;
 		}
 	}
+}
+
+method !revision-clock(--> Int:D) { nqp::time() }
+
+method !revision-time(--> Int:D) {
+	my $clock = self!revision-clock;
+	if $!revision-last-clock.defined && $clock < $!revision-last-clock {
+		%!revision-cache = ();
+		@!revision-cache-order = ();
+	}
+	$!revision-last-clock = $clock;
+	$clock;
+}
+
+# All identity and time fields come from one lstat snapshot. Unusable
+# metadata disables reuse; it must not turn an otherwise readable file bad.
+method !revision-stat(IO::Path:D $path --> List) {
+	my $stat := nqp::syscall('file-stat', nqp::decont_s($path.absolute), 1);
+	return List unless nqp::syscall('stat-flags', $stat, nqp::const::STAT_ISREG);
+	my @fields =
+		nqp::syscall('stat-flags', $stat, nqp::const::STAT_PLATFORM_MODE),
+		nqp::syscall('stat-flags', $stat, nqp::const::STAT_PLATFORM_DEV),
+		nqp::syscall('stat-flags', $stat, nqp::const::STAT_PLATFORM_INODE),
+		nqp::syscall('stat-flags', $stat, nqp::const::STAT_FILESIZE),
+		nqp::syscall('stat-time-nanos', $stat, nqp::const::STAT_MODIFYTIME),
+		nqp::syscall('stat-time-nanos', $stat, nqp::const::STAT_CHANGETIME);
+	return List unless @fields[0] > 0 && @fields[1] >= 0 && @fields[2] > 0
+		&& @fields[3] >= 0 && @fields[4] > 0 && @fields[5] > 0;
+	@fields.List;
+}
+
+method !revision-old(List:D $stat, Int:D $clock --> Bool:D) {
+	$stat[4] < $clock - REVISION-TIME-GUARD
+		&& $stat[5] < $clock - REVISION-TIME-GUARD;
+}
+
+method !compact-revision-order(--> Nil) {
+	@!revision-cache-order = @!revision-cache-order.grep(-> $queued {
+		(%!revision-cache{$queued.key}:exists)
+			&& %!revision-cache{$queued.key} === $queued.value;
+	});
+}
+
+method !remember-revision(Str:D $key, RevisionDigest:D $entry --> Nil) {
+	%!revision-cache{$key}:delete;
+	while %!revision-cache.elems >= REVISION-CACHE-LIMIT {
+		my $old = @!revision-cache-order.shift;
+		%!revision-cache{$old.key}:delete
+			if (%!revision-cache{$old.key}:exists)
+				&& %!revision-cache{$old.key} === $old.value;
+	}
+	%!revision-cache{$key} = $entry;
+	@!revision-cache-order.push: $key => $entry;
+	# Replacing one path repeatedly must not grow the admission queue forever.
+	self!compact-revision-order if @!revision-cache-order.elems > 2 * REVISION-CACHE-LIMIT;
+}
+
+method !invalidate-revisions(@locations --> Nil) {
+	my @targets = @locations.map({ self!resolve(.value.Str) });
+	for %!revision-cache.keys -> $key {
+		%!revision-cache{$key}:delete if @targets.first(-> $target {
+			path-contains($target, $key.IO);
+		}).defined;
+	}
+	self!compact-revision-order;
+}
+
+method !revision-open(IO::Path:D $path --> RevisionReader:D) {
+	RevisionReader.new(:$path);
+}
+
+method !revision-file(
+	IO::Path:D $path, Bool:D :$fresh = False,
+	RevisionBuffers:D :$buffers = RevisionBuffers.new --> Hash:D
+) {
+	my $start = self!revision-time;
+	my $key = $path.SPEC.canonpath($path.absolute);
+	my $before = try self!revision-stat($path);
+	my $cached = %!revision-cache{$key};
+	if !$fresh && $before.defined && $cached.defined
+		&& $before eqv $cached.stat && self!revision-old($before, $start) {
+		return %( digest => $cached.digest, bytes => $cached.bytes );
+	}
+	%!revision-cache{$key}:delete;
+
+	my $handle = self!revision-open($path);
+	my ($digest, $bytes);
+	{
+		CATCH {
+			default {
+				my $error = $_;
+				try $handle.close;
+				$error.rethrow;
+			}
+		}
+		# Most source files fit one chunk. Avoid a Supply/react subscription
+		# for those files, without trusting stat size to establish EOF.
+		my $first = $handle.read(64 * 1024, buf => $buffers.first);
+		my $second = $handle.read(64 * 1024, buf => $buffers.second);
+		$digest = $second.bytes
+			?? sha256-hex(supply {
+				emit $first;
+				emit $second;
+				loop {
+					# Native consumes synchronously before emit returns and
+					# retains no input pointer, so this buffer can be reused.
+					my $chunk = $handle.read(64 * 1024, buf => $buffers.first);
+					last unless $chunk.bytes;
+					emit $chunk;
+				}
+			})
+			!! sha256-hex($first);
+		$bytes = $handle.tell;
+		$handle.close;
+	}
+	my $after = try self!revision-stat($path);
+	my $finish = self!revision-time;
+	if $before.defined && $after.defined && $before eqv $after
+		&& $bytes == $before[3] && $finish >= $start
+		&& self!revision-old($before, $start) {
+		self!remember-revision($key, RevisionDigest.new(
+			stat => $before, :$digest, :$bytes,
+		));
+	}
+	%( :$digest, :$bytes );
 }
 
 # === Tool implementations ===

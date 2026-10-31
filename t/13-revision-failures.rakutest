@@ -28,36 +28,19 @@ sub fixture-path-key(IO::Path:D $path --> Str:D) {
 	$path.SPEC.canonpath($path.Str);
 }
 
-# Scope a failed open to one real entry in the revision traversal. The tools'
-# action paths still use ordinary IO::Path objects, so a move really renames
-# the directory before its destination revision encounters this failure.
+# Scope a failure to the owned revision-reader open boundary. The action
+# paths still use ordinary IO::Path objects, so a move really renames the
+# directory before its destination revision encounters this failed open.
 sub unreadable-entry($kit, Str:D $directory, Str:D $leaf --> Hash:D) {
-	my $target = fixture-path-key($kit.root.add($directory));
+	my $target = fixture-path-key($kit.root.add($directory).add($leaf));
 	my $faults = 0;
-	my $method = MCP::Server::Tool::FileSystem.^find_private_method('revision-tree');
-	my $wrapper = $method.wrap(-> $self, IO::Path:D $dir, Str:D $prefix,
-		@records is raw, *%named {
-		if $self === $kit && fixture-path-key($dir) eq $target {
-			my $unreadable = $dir but role {
-				method dir(|capture) {
-					my @entries = callsame;
-					@entries.map(-> $entry {
-						$entry.basename eq $leaf
-							?? ($entry but role {
-								method open(|capture) {
-									$faults++;
-									die 'synthetic permission denied';
-								}
-							})
-							!! $entry;
-					}).List;
-				}
-			};
-			nextwith($self, $unreadable, $prefix, @records, |%named);
+	my $method = MCP::Server::Tool::FileSystem.^find_private_method('revision-open');
+	my $wrapper = $method.wrap(-> $self, IO::Path:D $path {
+		if $self === $kit && fixture-path-key($path) eq $target {
+			$faults++;
+			die 'synthetic permission denied';
 		}
-		else {
-			callsame;
-		}
+		else { callsame }
 	});
 	%(
 		restore => -> { $method.unwrap($wrapper) },
@@ -65,27 +48,34 @@ sub unreadable-entry($kit, Str:D $directory, Str:D $leaf --> Hash:D) {
 	);
 }
 
+# Register this wrapper before the first observation: stock compilers can
+# retain an already-resolved private Routine when a later wrap replaces it.
+my %directory-faults;
+my $tree-method = MCP::Server::Tool::FileSystem.^find_private_method('revision-tree');
+my $tree-wrapper = $tree-method.wrap(-> $self, IO::Path:D $dir, Str:D $prefix,
+	@records is raw, *%named {
+	my $fault = %directory-faults{$self.WHICH};
+	if $fault.defined && fixture-path-key($dir) eq $fault<target> {
+		my $unreadable = $dir but role {
+			method dir(|capture) {
+				$fault<hit>();
+				die 'synthetic directory permission denied';
+			}
+		};
+		callwith($self, $unreadable, $prefix, @records, |%named);
+	}
+	else { callsame }
+});
+END { $tree-method.unwrap($tree-wrapper) if $tree-wrapper.defined }
+
 sub unreadable-directory($kit, Str:D $directory --> Hash:D) {
-	my $target = fixture-path-key($kit.root.add($directory));
 	my $faults = 0;
-	my $method = MCP::Server::Tool::FileSystem.^find_private_method('revision-tree');
-	my $wrapper = $method.wrap(-> $self, IO::Path:D $dir, Str:D $prefix,
-		@records is raw, *%named {
-		if $self === $kit && fixture-path-key($dir) eq $target {
-			my $unreadable = $dir but role {
-				method dir(|capture) {
-					$faults++;
-					die 'synthetic directory permission denied';
-				}
-			};
-			nextwith($self, $unreadable, $prefix, @records, |%named);
-		}
-		else {
-			callsame;
-		}
-	});
+	%directory-faults{$kit.WHICH} = %(
+		target => fixture-path-key($kit.root.add($directory)),
+		hit => -> { $faults++ },
+	);
 	%(
-		restore => -> { $method.unwrap($wrapper) },
+		restore => -> { %directory-faults{$kit.WHICH}:delete },
 		faults => -> { $faults },
 	);
 }

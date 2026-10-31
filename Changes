@@ -2,6 +2,14 @@ Revision history for MCP::Server::Tool::FileSystem
 
 {{$NEXT}}
 
+0.3.4  2026-10-31T20:55:35Z
+    - PERF: [2026-10-31] Stream revision hashing with two reusable buffers and
+      reuse up to 8192 stable, mature file digests per toolkit instance.
+      Full directory coverage and exact sha256-v1 tokens are unchanged.
+      Conditional mutation comparisons always hash fresh bytes, and
+      mutations invalidate affected cached paths before acting.
+      Requires Digest::SHA256::Native 1.0.2 or later.
+
 0.3.3  2026-10-31T19:00:55Z
     - MAINT: [2026-10-31] Compare revision test paths with native lexical
       path rules. Mixed Windows separators now reach the intended
