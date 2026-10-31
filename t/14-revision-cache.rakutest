@@ -11,6 +11,7 @@ use nqp;
 # to one instance; all other instances retain the actual clock and metadata.
 my %clocks;
 my %stat-overrides;
+my %raw-stat-overrides;
 my $clock-method = MCP::Server::Tool::FileSystem.^find_private_method('revision-clock');
 my $clock-wrapper = $clock-method.wrap(-> $self {
 	(%clocks{$self.WHICH}:exists) ?? %clocks{$self.WHICH} !! callsame;
@@ -21,9 +22,16 @@ my $stat-wrapper = $stat-method.wrap(-> $self, IO::Path:D $path {
 	(%stat-overrides{$self.WHICH}:exists)
 		?? %stat-overrides{$self.WHICH}($path, $actual) !! $actual;
 });
+my $raw-stat-method = MCP::Server::Tool::FileSystem.^find_private_method('revision-stat-fields');
+my $raw-stat-wrapper = $raw-stat-method.wrap(-> $self, IO::Path:D $path {
+	my $actual = callsame;
+	(%raw-stat-overrides{$self.WHICH}:exists)
+		?? %raw-stat-overrides{$self.WHICH}($path, $actual) !! $actual;
+});
 END {
 	$clock-method.unwrap($clock-wrapper) if $clock-wrapper.defined;
 	$stat-method.unwrap($stat-wrapper) if $stat-wrapper.defined;
+	$raw-stat-method.unwrap($raw-stat-wrapper) if $raw-stat-wrapper.defined;
 }
 
 sub fixture(Str:D $tag --> Hash:D) {
@@ -112,6 +120,14 @@ sub fixture-file(%f, Str:D $text = 'old bytes' --> IO::Path:D) {
 	$file;
 }
 
+sub snapshot-details($kit, IO::Path:D $file --> Str:D) {
+	my $fields = try $raw-stat-method($kit, $file);
+	return "raw sampler returned {$fields.raku}" unless $fields.defined;
+	<mode device inode size mtime-units ctime-units>.kv.map(-> $i, $name {
+		"$name={$fields[$i].raku}";
+	}).join(', ');
+}
+
 subtest 'an unchanged mature tree reuses file digests' => {
 	plan 8;
 	my %f = fixture('warm');
@@ -123,6 +139,9 @@ subtest 'an unchanged mature tree reuses file digests' => {
 	# Both the change time and modification time must leave the racy window.
 	sleep 2.2;
 	my %first = call-tool(%f<server>, 'fs_list', { path => 'tree' });
+	diag snapshot-details(%f<kit>, %f<root>.add('tree').add('file.txt'))
+		~ ", clock={$clock-method(%f<kit>).raku}"
+		unless cache(%f<kit>).elems == 1;
 	nok result-errored(%first), 'the first observation succeeds';
 	is %first<result><structuredContent><revisions><path><state>, 'directory',
 		'the first observation has a usable directory revision';
@@ -134,6 +153,86 @@ subtest 'an unchanged mature tree reuses file digests' => {
 	is token(%second), token(%first), 'the exact revision token is unchanged';
 	is %count<opens>(), 1, 'the repeated revision opens no files';
 	is result-text(%second), result-text(%first), 'the list text is unchanged';
+};
+
+subtest 'opaque signed device and inode bits can authorize stable reuse' => {
+	plan 24;
+	for (-1 => -2, (-(2 ** 63)) => (-(2 ** 63))) -> $identity {
+		my %f = fixture("signed-{$identity.key}");
+		LEAVE nuke(%f<root>);
+		fixture-file(%f);
+		mature(%f<kit>);
+		my $device = $identity.key;
+		my $inode = $identity.value;
+		%raw-stat-overrides{%f<kit>.WHICH} = -> $path, $actual {
+			my @fields = $actual.list;
+			@fields[1] = $device;
+			@fields[2] = $inode;
+			@fields.List;
+		};
+		my %count = counted-files(%f<kit>);
+		LEAVE { %count<restore>() if %count<restore>.defined }
+		my $before = token(observe(%f));
+		is %count<opens>(), 1, 'the first observation really hashes';
+		is cache(%f<kit>).elems, 1, 'signed identity metadata is admitted';
+		is token(observe(%f)), $before, 'the repeated exact content token is unchanged';
+		is %count<opens>(), 1, 'the unchanged observation reuses the digest';
+		my $entry = cache(%f<kit>).values.head;
+		is $entry.defined ?? $entry.stat[1] !! Int, $identity.key,
+			'device bits retain their signed representation';
+		is $entry.defined ?? $entry.stat[2] !! Int, $identity.value,
+			'inode bits retain their signed representation';
+		$device = 1;
+		is token(observe(%f)), $before, 'changed device still hashes the same file bytes';
+		is %count<opens>(), 2, 'device sign-bit differences require another real read';
+		is cache(%f<kit>).values.head.stat[1], 1, 'the new device bits replace the old entry';
+		$inode = $identity.value == -2 ?? 2 !! $identity.value + 1;
+		is token(observe(%f)), $before, 'changed inode still hashes the same file bytes';
+		is %count<opens>(), 3, 'inode sign-bit differences require another real read';
+		is cache(%f<kit>).values.head.stat[2], $inode, 'the new inode bits replace the old entry';
+	}
+};
+
+subtest 'identity eligibility rejects unsupported inode values' => {
+	plan 7;
+	my %f = fixture('identity-eligibility');
+	LEAVE nuke(%f<root>);
+	my $usable = MCP::Server::Tool::FileSystem.^find_private_method('revision-stat-usable');
+	for 0, -1 -> $inode {
+		nok $usable(%f<kit>, (33188, -1, $inode, 0, 1, 1)),
+			"inode $inode cannot justify reuse";
+	}
+	for 0, -1, -(2 ** 63) -> $device {
+		ok $usable(%f<kit>, (33188, $device, -2, 0, 1, 1)),
+			"device $device remains an opaque identity value";
+	}
+	nok $usable(%f<kit>, (33188, 1, 1)), 'incomplete metadata cannot authorize reuse';
+	nok $usable(%f<kit>, (33188, 1, 1, 0, Num, 1)),
+		'undefined metadata cannot authorize reuse';
+};
+
+subtest 'snapshot timestamps retain full epoch magnitude and integer units' => {
+	plan 9;
+	my %f = fixture('epoch');
+	LEAVE nuke(%f<root>);
+	my $file = fixture-file(%f);
+	my $clock = $clock-method(%f<kit>);
+	isa-ok $clock, Int, 'the actual unmocked revision clock returns integer units';
+	my $fields = $raw-stat-method(%f<kit>, $file);
+	my $usable = $fields.defined && $fields.elems == 6;
+	ok $usable, 'the raw snapshot contains all six metadata fields';
+	bail-out snapshot-details(%f<kit>, $file) unless $usable;
+	isa-ok $fields[4], Int, 'mtime is expressed in integer clock units';
+	isa-ok $fields[5], Int, 'ctime is expressed in integer clock units';
+	ok abs($fields[4] - $clock) < 10_000_000_000, 'mtime has the full current epoch magnitude';
+	ok abs($fields[5] - $clock) < 10_000_000_000, 'ctime has the full current epoch magnitude';
+	nok $stat-method(%f<kit>, %f<root>.add('missing')).defined,
+		'a missing path cannot supply reusable metadata';
+	my $units = MCP::Server::Tool::FileSystem.^find_private_method('revision-time-units');
+	is $units(%f<kit>, 1_800_000_000e0), 1_800_000_000_000_000_000,
+		'whole Float64 epoch seconds scale without signed-32-bit wrap';
+	ok abs($units(%f<kit>, 1_800_000_000.123456e0) - 1_800_000_000_123_456_000) < 250,
+		'fractional epoch conversion error fits the conservative rounding allowance';
 };
 
 subtest 'streaming preserves legacy canonical tokens and bounds reads' => {
@@ -222,7 +321,7 @@ subtest 'streaming failures close handles and preserve successful action text' =
 };
 
 subtest 'the time guard checks both timestamps at its exact boundary' => {
-	plan 5;
+	plan 7;
 	my %f = fixture('guard');
 	LEAVE nuke(%f<root>);
 	my $old = MCP::Server::Tool::FileSystem.^find_private_method('revision-old');
@@ -231,8 +330,12 @@ subtest 'the time guard checks both timestamps at its exact boundary' => {
 		'an mtime exactly at the two-second boundary is racy';
 	nok $old(%f<kit>, (1, 1, 1, 0, 7_000_000_000, 8_000_000_000), $clock),
 		'a ctime exactly at the two-second boundary is racy';
-	ok $old(%f<kit>, (1, 1, 1, 0, 7_999_999_999, 7_999_999_999), $clock),
-		'both timestamps strictly older than the guard qualify';
+	nok $old(%f<kit>, (1, 1, 1, 0, 7_999_999_000, 7_000_000_000), $clock),
+		'an mtime at the guard plus one-microsecond allowance remains racy';
+	nok $old(%f<kit>, (1, 1, 1, 0, 7_000_000_000, 7_999_999_000), $clock),
+		'a ctime at the guard plus one-microsecond allowance remains racy';
+	ok $old(%f<kit>, (1, 1, 1, 0, 7_999_998_999, 7_999_998_999), $clock),
+		'both timestamps strictly older than the guard and allowance qualify';
 	nok $old(%f<kit>, (1, 1, 1, 0, 11_000_000_000, 7_000_000_000), $clock),
 		'a future mtime cannot qualify';
 	nok $old(%f<kit>, (1, 1, 1, 0, 7_000_000_000, 11_000_000_000), $clock),
@@ -246,7 +349,7 @@ subtest 'directory framing uses bytes actually read rather than stat size' => {
 	fixture-file(%f, 'actual bytes');
 	mature(%f<kit>);
 	%stat-overrides{%f<kit>.WHICH} = -> $path, $actual {
-		my @copy = $actual;
+		my @copy = $actual.list;
 		@copy[3] += 123;
 		@copy.List;
 	};
@@ -261,11 +364,14 @@ subtest 'directory framing uses bytes actually read rather than stat size' => {
 };
 
 subtest 'a recent digest must be read again after its timestamps mature' => {
-	plan 6;
+	plan 7;
 	my %f = fixture('racy');
 	LEAVE nuke(%f<root>);
 	my $file = fixture-file(%f);
 	my $metadata = $stat-method(%f<kit>, $file);
+	my $usable = $metadata.defined && $metadata.elems == 6;
+	ok $usable, 'the racy fixture has usable six-field metadata';
+	bail-out snapshot-details(%f<kit>, $file) unless $usable;
 	%clocks{%f<kit>.WHICH} = max($metadata[4], $metadata[5]) + 1_000_000_000;
 	my %count = counted-files(%f<kit>);
 	LEAVE { %count<restore>() if %count<restore>.defined }
@@ -305,7 +411,7 @@ subtest 'unstable snapshots and rollback invalidate reuse' => {
 	mature(%f<kit>);
 	my $snapshots = 0;
 	%stat-overrides{%f<kit>.WHICH} = -> $path, $actual {
-		my @copy = $actual;
+		my @copy = $actual.list;
 		@copy[5] += ++$snapshots;
 		@copy.List;
 	};

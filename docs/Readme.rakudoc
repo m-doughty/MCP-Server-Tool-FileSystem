@@ -170,6 +170,7 @@ Each toolkit instance retains at most 8192 file digests for reuse.
 This bounds memo storage, without limiting traversal or changing token values.
 Reuse requires matching identity, size, modification time and change time.
 Metadata must remain stable across hashing, with both timestamps over two seconds old.
+Timestamp comparisons include a conservative allowance for rounding.
 Recent files must be read again after that window before reuse becomes possible.
 A backward clock adjustment clears the memo.
 

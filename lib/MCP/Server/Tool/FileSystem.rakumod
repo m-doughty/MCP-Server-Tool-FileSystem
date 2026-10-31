@@ -66,6 +66,7 @@ my constant REVISION-SCHEME = 'sha256-v1';
 my constant EXPECTED-REVISIONS = '_expected-revisions';
 my constant REVISION-CACHE-LIMIT = 8192;
 my constant REVISION-TIME-GUARD = 2_000_000_000;
+my constant REVISION-TIME-ROUNDING = 1000;
 
 my class RevisionDigest {
 	has List:D $.stat is required;
@@ -652,26 +653,45 @@ method !revision-time(--> Int:D) {
 	$clock;
 }
 
-# All identity and time fields come from one lstat snapshot. Unusable
-# metadata disables reuse; it must not turn an otherwise readable file bad.
-method !revision-stat(IO::Path:D $path --> List) {
+# All fields come from one lstat snapshot. Float64 epoch seconds avoid the
+# Windows long overflow in stat-time-nanos. Scaling supplies common units,
+# not exact nanosecond precision; the age guard includes rounding allowance.
+method !revision-stat-fields(IO::Path:D $path --> List) {
 	my $stat := nqp::syscall('file-stat', nqp::decont_s($path.absolute), 1);
+	return List unless nqp::syscall('stat-flags', $stat, nqp::const::STAT_EXISTS);
 	return List unless nqp::syscall('stat-flags', $stat, nqp::const::STAT_ISREG);
 	my @fields =
 		nqp::syscall('stat-flags', $stat, nqp::const::STAT_PLATFORM_MODE),
 		nqp::syscall('stat-flags', $stat, nqp::const::STAT_PLATFORM_DEV),
 		nqp::syscall('stat-flags', $stat, nqp::const::STAT_PLATFORM_INODE),
 		nqp::syscall('stat-flags', $stat, nqp::const::STAT_FILESIZE),
-		nqp::syscall('stat-time-nanos', $stat, nqp::const::STAT_MODIFYTIME),
-		nqp::syscall('stat-time-nanos', $stat, nqp::const::STAT_CHANGETIME);
-	return List unless @fields[0] > 0 && @fields[1] >= 0 && @fields[2] > 0
-		&& @fields[3] >= 0 && @fields[4] > 0 && @fields[5] > 0;
+		self!revision-time-units(nqp::syscall('stat-time', $stat, nqp::const::STAT_MODIFYTIME)),
+		self!revision-time-units(nqp::syscall('stat-time', $stat, nqp::const::STAT_CHANGETIME));
 	@fields.List;
 }
 
+method !revision-time-units(Num:D $seconds --> Int:D) {
+	($seconds * 1_000_000_000).Int;
+}
+
+method !revision-stat-usable(List:D $fields --> Bool:D) {
+	return False unless $fields.elems == 6;
+	for $fields.list -> $field { return False unless $field ~~ Int:D }
+	# Device and inode fields preserve opaque uint64 bits as signed Ints.
+	# Windows uses inode 0/-1 for unsupported or non-unique identities.
+	$fields[0] > 0 && $fields[2] != 0 && $fields[2] != -1
+		&& $fields[3] >= 0 && $fields[4] > 0 && $fields[5] > 0;
+}
+
+# Unusable metadata disables reuse without preventing an actual content read.
+method !revision-stat(IO::Path:D $path --> List) {
+	my $fields = self!revision-stat-fields($path);
+	$fields.defined && self!revision-stat-usable($fields) ?? $fields !! List;
+}
+
 method !revision-old(List:D $stat, Int:D $clock --> Bool:D) {
-	$stat[4] < $clock - REVISION-TIME-GUARD
-		&& $stat[5] < $clock - REVISION-TIME-GUARD;
+	my $cutoff = $clock - REVISION-TIME-GUARD - REVISION-TIME-ROUNDING;
+	$stat[4] < $cutoff && $stat[5] < $cutoff;
 }
 
 method !compact-revision-order(--> Nil) {
