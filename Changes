@@ -2,6 +2,13 @@ Revision history for MCP::Server::Tool::FileSystem
 
 {{$NEXT}}
 
+0.3.5  2026-10-31T21:32:44Z
+    - BUGFIX: [2026-10-31] Make revision memo metadata portable on Windows.
+      Sample epoch seconds without signed-32-bit timestamp overflow and
+      retain opaque signed device and inode bits. Add a conservative
+      rounding allowance to timestamp age checks. Unsupported inode
+      identities still disable reuse, and conditional comparisons hash fresh.
+
 0.3.4  2026-10-31T20:55:35Z
     - PERF: [2026-10-31] Stream revision hashing with two reusable buffers and
       reuse up to 8192 stable, mature file digests per toolkit instance.
