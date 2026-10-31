@@ -9,7 +9,7 @@ use MCP::Server::Tool::FileSystem;
 # so the expected strings below are output format rather than host paths.
 # Everything that touches the disk is built with IO::Path.add.
 
-plan 15;
+plan 22;
 
 my $sandbox = make-sandbox('tools');
 END nuke($sandbox);
@@ -286,6 +286,202 @@ subtest 'edit' => {
 	});
 	is-deeply $crlf.slurp(:bin).list, "alpha\r\nBETA\r\ngamma\r\n".encode('utf-8').list,
 		'Editing one line of a CRLF file leaves every byte of the others alone';
+};
+
+subtest 'edit refuses non-NFC bytes without changing the file' => {
+	plan 40;
+	my $server = fs-server();
+	my $dir = $sandbox.add('scratch').add('edit-normalization');
+	$dir.mkdir;
+	# Numeric UTF-8 bytes prevent Raku string construction normalizing fixtures.
+	my @cases =
+		%( name => 'nfd', bytes => [0x65, 0xCC, 0x81] ),
+		%( name => 'hangul', bytes => [0xE1, 0x84, 0x92, 0xE1, 0x85, 0xA1, 0xE1, 0x86, 0xAB] ),
+		%( name => 'singletons', bytes => [0xE2, 0x84, 0xA6, 0x20, 0xE2, 0x84, 0xAB] ),
+		%( name => 'combining-order', bytes => [0x61, 0xCC, 0x95, 0xCC, 0x80] );
+	for @cases -> %case {
+		for False, True -> $bom {
+			my $name = %case<name> ~ ($bom ?? '-bom' !! '') ~ '.txt';
+			my $payload = Blob.new(|%case<bytes>.list, 0x0A, |'TARGET'.encode.list, 0x0D, 0x0A);
+			my $before = Blob.new(|($bom ?? (0xEF, 0xBB, 0xBF) !! ()), |$payload.list);
+			my $path = $dir.add($name);
+			$path.spurt($before, :bin);
+			isnt $payload.decode('utf-8').encode('utf-8').list.join(','), $payload.list.join(','),
+				"$name actually contains non-NFC bytes";
+			is result-text(call-tool($server, 'fs_read', { path => "scratch/edit-normalization/$name" })),
+				$before.decode('utf-8'), "$name keeps the existing normalized read view";
+			my %result = call-tool($server, 'fs_edit', {
+				path => "scratch/edit-normalization/$name",
+				'old-string' => 'TARGET', 'new-string' => 'CHANGED',
+			});
+			ok result-errored(%result), "$name is refused before writing";
+			like result-text(%result), /'not in NFC'/, "$name explains the normalization cause";
+			is-deeply $path.open(:bin).slurp(:close).list, $before.list,
+				"$name remains completely byte-identical";
+		}
+	}
+};
+
+subtest 'edit preserves the exact leading UTF-8 BOM count' => {
+	plan 9;
+	my $server = fs-server();
+	for 1..3 -> $headers {
+		my $name = "edit-bom-$headers.txt";
+		my $path = $sandbox.add('scratch').add($name);
+		my @header;
+		for ^$headers { @header.append(0xEF, 0xBB, 0xBF) }
+		my $before = Blob.new(|@header, |"lead\r\nTARGET\r\ntail\0👩‍💻\r".encode.list);
+		my $expected = Blob.new(|@header, |"lead\r\nCHANGED\r\ntail\0👩‍💻\r".encode.list);
+		$path.spurt($before, :bin);
+		my %result = call-tool($server, 'fs_edit', {
+			path => "scratch/$name", 'old-string' => 'TARGET', 'new-string' => 'CHANGED',
+		});
+		nok result-errored(%result), "$headers leading BOM sequences edit successfully";
+		is result-text(%result), "Replaced 1 occurrence in 'scratch/$name'; wrote {$expected.bytes} bytes",
+			'the byte count includes every preserved BOM sequence';
+		is-deeply $path.open(:bin).slurp(:close).list, $expected.list,
+			'the BOM count, CRLF, NUL, emoji and lone CR retain their exact bytes';
+	}
+};
+
+subtest 'NFC edits and empty replace-all retain exact untouched bytes' => {
+	plan 8;
+	my $server = fs-server();
+	for False, True -> $bom {
+		my $name = $bom ?? 'nfc-bom.txt' !! 'nfc.txt';
+		my $path = $sandbox.add('scratch').add($name);
+		# NFC é, 한, Ω, Å and an internal U+FEFF precede ASCII matches.
+		my @prefix = 0xC3, 0xA9, 0x20, 0xED, 0x95, 0x9C, 0x20,
+			0xCE, 0xA9, 0x20, 0xC3, 0x85, 0xEF, 0xBB, 0xBF, 0x0D, 0x0A;
+		my $before = Blob.new(|($bom ?? (0xEF, 0xBB, 0xBF) !! ()),
+			|@prefix, |"TARGET\0TARGET👩‍💻\r".encode.list);
+		my $expected = Blob.new(|($bom ?? (0xEF, 0xBB, 0xBF) !! ()),
+			|@prefix, |"\0👩‍💻\r".encode.list);
+		$path.spurt($before, :bin);
+		my %result = call-tool($server, 'fs_edit', {
+			path => "scratch/$name", 'old-string' => 'TARGET', 'new-string' => '',
+			'replace-all' => True,
+		});
+		nok result-errored(%result), "$name accepts an empty replacement";
+		is result-text(%result), "Replaced 2 occurrences in 'scratch/$name'; wrote {$expected.bytes} bytes",
+			"$name counts every replacement and every output byte";
+		is-deeply $path.open(:bin).slurp(:close).list, $expected.list,
+			"$name preserves every unselected NFC, control and BOM byte";
+		is result-text(call-tool($server, 'fs_read', { path => "scratch/$name" })),
+			$expected.decode('utf-8'), "$name retains the existing read result";
+	}
+};
+
+subtest 'edit errors leave the complete raw file unchanged' => {
+	plan 32;
+	my $server = fs-server();
+	my @cases =
+		%( name => 'invalid-utf8', bytes => [0x54, 0x41, 0x52, 0x47, 0x45, 0x54, 0xFF],
+			old => 'TARGET', new => 'X', cause => 'not valid UTF-8' ),
+		%( name => 'invalid-utf8-bom', bytes => [0xEF, 0xBB, 0xBF, 0xC3, 0x28],
+			old => 'TARGET', new => 'X', cause => 'not valid UTF-8' ),
+		%( name => 'empty', bytes => [], old => 'TARGET', new => 'X', cause => 'No occurrence' ),
+		%( name => 'bom-only', bytes => [0xEF, 0xBB, 0xBF],
+			old => 'TARGET', new => 'X', cause => 'No occurrence' ),
+		%( name => 'no-match', bytes => [0xEF, 0xBB, 0xBF, 0x41],
+			old => 'TARGET', new => 'X', cause => 'No occurrence' ),
+		%( name => 'no-op', bytes => [0xEF, 0xBB, 0xBF, 0x41],
+			old => 'A', new => 'A', cause => 'are identical' ),
+		%( name => 'empty-old', bytes => [0xEF, 0xBB, 0xBF, 0x41],
+			old => '', new => 'X', cause => 'must not be empty' ),
+		%( name => 'ambiguous', bytes => [0xEF, 0xBB, 0xBF, 0x41, 0x20, 0x41],
+			old => 'A', new => 'X', cause => 'Found 2 occurrences' );
+	for @cases -> %case {
+		my $path = $sandbox.add('scratch').add(%case<name> ~ '.txt');
+		my $before = Blob.new(|%case<bytes>.list);
+		$path.spurt($before, :bin);
+		my %result = call-tool($server, 'fs_edit', {
+			path => "scratch/{%case<name>}.txt", 'old-string' => %case<old>, 'new-string' => %case<new>,
+		});
+		ok result-errored(%result), "{%case<name>} returns an error";
+		ok result-text(%result).contains(%case<cause>), "{%case<name>} names the actual error cause";
+		is-deeply $path.open(:bin).slurp(:close).list, $before.list,
+			"{%case<name>} preserves the full raw byte sequence";
+		ok $path.e, "{%case<name>} keeps the original file";
+	}
+};
+
+subtest 'edit refuses normalization across replacement boundaries' => {
+	plan 28;
+	my $server = fs-server();
+	my @cases =
+		%( name => 'left', bytes => [0x61, 0x58], new => "\x[0301]", all => False ),
+		%( name => 'right', bytes => [0x58, 0xE1, 0x85, 0xA1], new => "\x[1100]", all => False ),
+		%( name => 'deletion', bytes => [0xE1, 0x84, 0x80, 0x58, 0xE1, 0x85, 0xA1], new => '', all => False ),
+		%( name => 'all-left', bytes => [0x61, 0x58, 0x61, 0x58], new => "\x[0301]", all => True ),
+		%( name => 'all-right', bytes => [0x58, 0xE1, 0x85, 0xA1, 0x20, 0x58, 0xE1, 0x85, 0xA1],
+			new => "\x[1100]", all => True ),
+		%( name => 'combining-right', bytes => [0x0A, 0xCC, 0x81],
+			old => "\n", new => 'a', all => False ),
+		%( name => 'combining-deletion', bytes => [0x61, 0x0A, 0xCC, 0x81],
+			old => "\n", new => '', all => False );
+	for @cases -> %case {
+		my $before = Blob.new(|%case<bytes>.list);
+		my $path = $sandbox.add('scratch').add("boundary-{%case<name>}.txt");
+		$path.spurt($before, :bin);
+		is-deeply $before.decode('utf-8').encode('utf-8').list, $before.list,
+			"{%case<name>} starts with lossless NFC input";
+		my %result = call-tool($server, 'fs_edit', {
+			path => "scratch/boundary-{%case<name>}.txt", 'old-string' => (%case<old> // 'X'),
+			'new-string' => %case<new>, 'replace-all' => %case<all>,
+		});
+		ok result-errored(%result), "{%case<name>} refuses adjacent normalization";
+		like result-text(%result), /'normalize adjacent text'/,
+			"{%case<name>} identifies the replacement-boundary cause";
+		is-deeply $path.open(:bin).slurp(:close).list, $before.list,
+			"{%case<name>} leaves every original byte unchanged";
+	}
+};
+
+subtest 'edit accepts explicitly included grapheme context' => {
+	plan 6;
+	my $server = fs-server();
+	my $path = $sandbox.add('scratch').add('explicit-context.txt');
+	$path.spurt("aX aX\r\n".encode, :bin);
+	my %result = call-tool($server, 'fs_edit', {
+		path => 'scratch/explicit-context.txt', 'old-string' => 'aX',
+		'new-string' => 'á', 'replace-all' => True,
+	});
+	nok result-errored(%result), 'including the neighboring base accepts composed replacements';
+	is result-text(%result), "Replaced 2 occurrences in 'scratch/explicit-context.txt'; wrote 7 bytes",
+		'explicit context retains replace-all counts and exact byte count';
+	is-deeply $path.open(:bin).slurp(:close).list, "á á\r\n".encode.list,
+		'only the explicitly selected context changes';
+	my $jamo = Blob.new(0xE1, 0x84, 0x80, 0x58, 0xE1, 0x85, 0xA1);
+	$path.spurt($jamo, :bin);
+	my %deletion = call-tool($server, 'fs_edit', {
+		path => 'scratch/explicit-context.txt', 'old-string' => $jamo.decode('utf-8'), 'new-string' => '',
+	});
+	nok result-errored(%deletion), 'deleting the full grapheme context is allowed';
+	is result-text(%deletion), "Replaced 1 occurrence in 'scratch/explicit-context.txt'; wrote 0 bytes",
+		'complete deletion reports its exact empty output';
+	is-deeply $path.open(:bin).slurp(:close).list, ().List, 'complete deletion writes no bytes';
+};
+
+subtest 'edit can delete a complete payload while retaining its BOM' => {
+	plan 6;
+	my $server = fs-server();
+	for 1, 2 -> $headers {
+		my $name = "delete-bom-$headers.txt";
+		my $path = $sandbox.add('scratch').add($name);
+		my @header;
+		for ^$headers { @header.append(0xEF, 0xBB, 0xBF) }
+		$path.spurt(Blob.new(|@header, |'TARGET'.encode.list), :bin);
+		my $old = $headers == 1 ?? 'TARGET' !! "\x[FEFF]TARGET";
+		my %result = call-tool($server, 'fs_edit', {
+			path => "scratch/$name", 'old-string' => $old, 'new-string' => '',
+		});
+		nok result-errored(%result), "$headers BOM sequences allow deletion of all editable text";
+		is result-text(%result), "Replaced 1 occurrence in 'scratch/$name'; wrote 3 bytes",
+			'the byte count includes only the retained header';
+		is-deeply $path.open(:bin).slurp(:close).list, (0xEF, 0xBB, 0xBF),
+			'the first BOM remains while explicitly matched U+FEFF content is deleted';
+	}
 };
 
 subtest 'grep' => {

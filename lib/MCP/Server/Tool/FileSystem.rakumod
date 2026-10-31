@@ -157,6 +157,7 @@ method register($registrar) {
 	$registrar.tool: 'read',
 		annotations => READ-ANNOTATIONS,
 		description => 'Read a UTF-8 text file from inside the server root. '
+			~ 'Returned text is NFC-normalized and omits one leading UTF-8 BOM. '
 			~ 'Paths are relative to that root; absolute paths and ".." are refused. '
 			~ 'Give offset and/or limit to read a window of lines instead of the '
 			~ 'whole file: that form numbers every line as "N<tab>text", so strip '
@@ -387,7 +388,9 @@ method register($registrar) {
 
 	$registrar.tool: 'edit',
 		description => 'Replace an exact run of text in a file inside the server '
-			~ 'root, leaving the rest of the file byte for byte as it was. '
+			~ 'root. Requires UTF-8 text already in NFC; preserves a leading BOM '
+			~ 'and every byte outside the match. Refuses edits that would normalize '
+			~ 'adjacent text; include that text in both strings instead. '
 			~ 'old-string must match exactly — whitespace, indentation and line '
 			~ 'endings included — and must appear exactly once unless replace-all '
 			~ 'is set, so read the file first and quote enough of it to be unique.',
@@ -796,8 +799,8 @@ method !read-file(Str:D $rel, Int $offset, Int $limit --> Str:D) {
 	my $text = slurp-text($path, $why);
 	die "Could not read '$rel' as UTF-8 text: $why" without $text;
 
-	# Asking for no range gets no presentation: the whole file comes back
-	# exactly as it sits on disk, line endings and all.
+	# Unranged output keeps decoded text and line endings without presentation.
+	# UTF-8 decoding normalizes to NFC and omits one leading BOM.
 	return $text unless $offset.defined || $limit.defined;
 
 	my @lines      = $text.lines;
@@ -826,11 +829,20 @@ method !edit-file(Str:D $rel, Str:D $old, Str:D $new, Bool:D $replace-all --> St
 	die "File not found: '$rel'" unless $path.e;
 	die "'$rel' is a directory; edit a file inside it instead" if $path.d;
 
+	my $raw = try slurp-file-bytes($path);
+	die "Could not read '$rel' as UTF-8 text: {error-line($!)}" without $raw;
+	my $bom = $raw.bytes >= 3 && $raw[0] == 0xEF && $raw[1] == 0xBB && $raw[2] == 0xBF;
+	my $payload = $bom ?? $raw.subbuf(3) !! $raw;
 	my Str $why;
-	my $text = slurp-text($path, $why);
+	# The decoder removes exactly one leading header. Decode the original
+	# bytes so additional U+FEFF content is retained rather than stripped.
+	my $text = decode-text($raw, $why);
 	die "Could not read '$rel' as UTF-8 text: $why" without $text;
+	die "File '$rel' is not in NFC; editing it would rewrite bytes outside the edit"
+		unless $text.encode('utf-8') eq $payload;
 
-	my Int:D $found = $text.indices($old).elems;
+	my @indices = $text.indices($old).list;
+	my Int:D $found = @indices.elems;
 	die "No occurrence of 'old-string' in '$rel'; read the file first and quote "
 		~ 'it exactly, including indentation and line endings'
 		if $found == 0;
@@ -839,9 +851,26 @@ method !edit-file(Str:D $rel, Str:D $old, Str:D $new, Bool:D $replace-all --> St
 		if $found > 1 && !$replace-all;
 
 	my $updated = $replace-all ?? $text.subst($old, $new, :g) !! $text.subst($old, $new);
-	# Written as bytes, not text: the encode here is the only place line
-	# endings could be rewritten, and it does not touch them.
-	my $bytes = $updated.encode('utf-8');
+	my $encoded = $updated.encode('utf-8');
+	# Encoding each fragment separately preserves its original boundaries.
+	# Joining Str fragments first would normalize the very change we check.
+	my $expected = Buf.new;
+	my $replacement = $new.encode('utf-8');
+	my $cursor = 0;
+	for @indices -> $index {
+		$expected.append($text.substr($cursor, $index - $cursor).encode('utf-8'));
+		$expected.append($replacement);
+		$cursor = $index + $old.chars;
+		last unless $replace-all;
+	}
+	$expected.append($text.substr($cursor).encode('utf-8'));
+	die "Edit of '$rel' would normalize adjacent text; include that text in old-string and new-string"
+		unless $encoded eq $expected;
+	my $bytes = $encoded;
+	if $bom {
+		$bytes = Buf.new(0xEF, 0xBB, 0xBF);
+		$bytes.append($encoded);
+	}
 	check-io($path.spurt($bytes), "Failed to write '$rel'");
 
 	my Int:D $done  = $replace-all ?? $found !! 1;
@@ -1610,8 +1639,8 @@ my sub slurp-file-bytes(IO::Path:D $path --> Blob) {
 #| Read a file as text with no newline translation at all.  IO::Path.slurp in
 #| text mode silently folds CRLF into LF and .spurt never puts it back, so a
 #| file edited through it would come back with every untouched line rewritten.
-#| Reading the bytes and decoding them once keeps the file's own line endings,
-#| which is what "verbatim" has to mean for a tool a model edits files with.
+#| Reading bytes and decoding once keeps the file's own line endings.
+#| Decoding normalizes text to NFC and omits one leading UTF-8 BOM.
 #| Returns an undefined Str and a reason in $why when the file cannot be read
 #| or is not UTF-8.
 my sub slurp-text(IO::Path:D $path, Str $why is rw --> Str) {

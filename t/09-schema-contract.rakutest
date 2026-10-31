@@ -17,7 +17,7 @@ use MCP::Server::Tool::FileSystem;
 # once passing the declared default explicitly — and demanding the same answer
 # both times. A default the handler does not really apply fails there.
 
-plan 5;
+plan 6;
 
 my $sandbox = make-sandbox('schema');
 END nuke($sandbox);
@@ -138,6 +138,20 @@ my @contracts = (
 		sample => %( path => 'scratch/nonempty' ),
 	),
 );
+
+subtest 'read and edit descriptions state normalization conditions' => {
+	plan 5;
+	like tool-schema($server, 'fs_read')<description>, /'NFC-normalized'/,
+		'read describes normalized text rather than raw bytes';
+	like tool-schema($server, 'fs_read')<description>, /'omits one leading UTF-8 BOM'/,
+		'read describes the existing BOM behavior';
+	like tool-schema($server, 'fs_edit')<description>, /'already in NFC'/,
+		'edit exposes its input normalization requirement';
+	like tool-schema($server, 'fs_edit')<description>, /'preserves a leading BOM'/,
+		'edit exposes its BOM preservation guarantee';
+	like tool-schema($server, 'fs_edit')<description>, /'Refuses edits that would normalize adjacent text'/,
+		'edit exposes its replacement-boundary refusal';
+};
 
 subtest 'every tool in the pack is under contract' => {
 	plan 1;

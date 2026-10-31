@@ -2,6 +2,14 @@ Revision history for MCP::Server::Tool::FileSystem
 
 {{$NEXT}}
 
+0.3.6  2026-10-31T22:26:19Z
+    - BUGFIX: [2026-10-31] Refuse edits of non-NFC UTF-8 files before
+      writing, preserving their complete original bytes. Preserve the
+      leading UTF-8 BOM and exact byte counts on successful edits.
+      Also refuse replacements or deletions that would normalize adjacent
+      text outside their matches. Read output remains normalized text;
+      descriptions now state these conditions explicitly.
+
 0.3.5  2026-10-31T21:32:44Z
     - BUGFIX: [2026-10-31] Make revision memo metadata portable on Windows.
       Sample epoch seconds without signed-32-bit timestamp overflow and

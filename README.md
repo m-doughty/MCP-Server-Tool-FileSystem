@@ -139,12 +139,12 @@ The five mutators accept a reserved `_expected-revisions` object keyed by `path`
 
 ### read(path, offset?, limit?)
 
-Slurps a UTF-8 text file. Errors if the path is missing, is a directory, or is not decodable text.
+Slurps a UTF-8 text file, returning NFC-normalized text with one leading BOM omitted. Errors if the path is missing, is a directory, or is not decodable text.
 
     { "name": "fs_read", "arguments": { "path": "notes/todo.md" } }
     => "- buy milk\n- feed the yak\n"
 
-With neither `offset` nor `limit`, what comes back is the file and nothing else: no numbering, no footer, no line-ending translation. That matters — the text is exactly what `edit` will be matching against later.
+With neither `offset` nor `limit`, decoded text returns without numbering or a footer. Original line endings remain intact. Unicode normalization and BOM handling still apply. `edit` matches this text, but refuses files whose bytes normalization would change.
 
 Pass `offset` (1-based) and/or `limit` to read a window of a long file instead. Ranged output is a *view*: each line is prefixed with its number and a tab, and a footer says where the window sits.
 
@@ -155,7 +155,7 @@ Pass `offset` (1-based) and/or `limit` to read a window of a long file instead. 
 
         [lines 40-42 of 900 total]"
 
-Strip the number and the tab before handing any of that text to `edit` as its `old-string` — the prefixes are not in the file. Windowed lines are split on line endings and rejoined with `\n`, so a CRLF file's `\r`s are not in the windowed output either: before building an `old-string` for a CRLF file, read it without `offset`/`limit` — the unranged form is byte-faithful.
+Strip the number and the tab before handing any of that text to `edit` as its `old-string` — the prefixes are not in the file. Windowed lines are split on line endings and rejoined with `\n`, so a CRLF file's `\r`s are not in the windowed output either: before building an `old-string` for a CRLF file, read it without `offset`/`limit` to retain its line endings.
 
 Reading past the end is an answer rather than an error, because that is how a model finds out where the end is:
 
@@ -176,7 +176,9 @@ Writes UTF-8 text, replacing any existing contents, and confirms with a byte cou
 
 ### edit(path, old-string, new-string, replace-all = false)
 
-Replaces one exact run of text and leaves the rest of the file byte for byte as it was. There is no fuzzy matching and no diff format to get wrong: `old-string` either appears in the file exactly — whitespace, indentation and line endings included — or the call is an error. Not registered when `read-only` is set.
+Replaces one exact run of UTF-8 text that is already NFC. Other normalization forms are refused before writing, leaving the file byte-identical. A leading UTF-8 BOM is preserved. Additional U+FEFF characters remain part of the editable text. Successful edits leave every byte outside the selected matches unchanged. There is no fuzzy matching and no diff format to get wrong: `old-string` either appears in the file exactly — whitespace, indentation and line endings included — or the call is an error. Not registered when `read-only` is set.
+
+Edits that would normalize adjacent text are also refused before writing. Include the neighboring grapheme context in both strings when that change is intended. For example, replacing `X` in `aX` with a combining acute accent is refused. Replace the complete `aX` with `á` to select that composition explicitly.
 
     { "name": "fs_edit", "arguments": {
         "path": "src/app.raku",
@@ -537,11 +539,11 @@ Path-component comparison is exact-case. On a case-insensitive filesystem, a roo
 
 ### Byte fidelity, and why CRLF is a security property
 
-`read` and `edit` never see a decoded-and-re-encoded copy of your file: they read bytes and decode them once, and `edit` writes bytes back.
+`read` and `edit` read bytes and decode them without newline translation. Decoding returns NFC-normalized text and omits one leading UTF-8 BOM. `edit` checks that encoding this text reproduces the original payload exactly. Files in other normalization forms are refused before writing. The remembered BOM is restored on successful edits.
 
 This is deliberate, and it took work. Raku's `IO::Path.slurp` in text mode silently folds `CRLF` into `LF`, and `.spurt` does not put it back. An `edit` that round-tripped through the text path would therefore rewrite the line endings of every line in the file it did not touch — a one-line change arriving as a whole-file diff. On a CRLF checkout that is not a cosmetic problem: it is an invisible, unreviewable change to code, made by a tool the reviewer trusts to change one line.
 
-So the guarantee is: **`edit` changes the bytes you asked it to change and no others**, and the text `read` hands back is what `edit` will be matching against, byte for byte. The cost is that an `old-string` copied out of a CRLF file must carry its CRLF; the alternative was silent corruption.
+The guarantee applies to UTF-8 files already in NFC and edits preserving adjacent text. `edit` refuses replacements or deletions that would normalize bytes outside their matches. Include that neighboring context in both strings if its composition should change. Every successful edit preserves the original BOM and all unselected bytes. An `old-string` copied from an unranged CRLF read must retain its CRLF.
 
 ### Regex interpolation
 
