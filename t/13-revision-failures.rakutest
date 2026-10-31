@@ -1,0 +1,233 @@
+use Test;
+use lib 'lib';
+use Digest::SHA256::Native;
+use MCP::Server;
+use MCP::Server::Tool::FileSystem;
+use MCP::Server::Tool::FileSystem::Test::Kit;
+
+plan 7;
+
+sub fixture(Str:D $tag --> Hash:D) {
+	my $root = make-sandbox("revision-failure-$tag");
+	my $kit = MCP::Server::Tool::FileSystem.new(:$root);
+	my $server = MCP::Server.new(:name<revision-failures>);
+	$server.plug: $kit;
+	%( root => $kit.root, :$kit, :$server );
+}
+
+sub make-tree(IO::Path:D $root, Str:D $name --> IO::Path:D) {
+	my $deep = $root.add($name).add('nested').add('deep');
+	$deep.mkdir;
+	$deep.add('locked.txt').spurt('unreadable payload');
+	$deep;
+}
+
+# Scope a failed open to one real entry in the revision traversal. The tools'
+# action paths still use ordinary IO::Path objects, so a move really renames
+# the directory before its destination revision encounters this failure.
+sub unreadable-entry($kit, Str:D $directory, Str:D $leaf --> Hash:D) {
+	my $target = $kit.root.add($directory).Str;
+	my $faults = 0;
+	my $method = MCP::Server::Tool::FileSystem.^find_private_method('revision-tree');
+	my $wrapper = $method.wrap(-> $self, IO::Path:D $dir, Str:D $prefix,
+		@records is raw, *%named {
+		if $self === $kit && $dir.Str eq $target {
+			my $unreadable = $dir but role {
+				method dir(|capture) {
+					my @entries = callsame;
+					@entries.map(-> $entry {
+						$entry.basename eq $leaf
+							?? ($entry but role {
+								method open(|capture) {
+									$faults++;
+									die 'synthetic permission denied';
+								}
+							})
+							!! $entry;
+					}).List;
+				}
+			};
+			nextwith($self, $unreadable, $prefix, @records, |%named);
+		}
+		else {
+			callsame;
+		}
+	});
+	%(
+		restore => -> { $method.unwrap($wrapper) },
+		faults => -> { $faults },
+	);
+}
+
+sub unreadable-directory($kit, Str:D $directory --> Hash:D) {
+	my $target = $kit.root.add($directory).Str;
+	my $faults = 0;
+	my $method = MCP::Server::Tool::FileSystem.^find_private_method('revision-tree');
+	my $wrapper = $method.wrap(-> $self, IO::Path:D $dir, Str:D $prefix,
+		@records is raw, *%named {
+		if $self === $kit && $dir.Str eq $target {
+			my $unreadable = $dir but role {
+				method dir(|capture) {
+					$faults++;
+					die 'synthetic directory permission denied';
+				}
+			};
+			nextwith($self, $unreadable, $prefix, @records, |%named);
+		}
+		else {
+			callsame;
+		}
+	});
+	%(
+		restore => -> { $method.unwrap($wrapper) },
+		faults => -> { $faults },
+	);
+}
+
+subtest 'a completed move survives an unreadable destination revision' => {
+	plan 10;
+	my %fixture = fixture('move');
+	LEAVE nuke(%fixture<root>);
+	make-tree(%fixture<root>, 'source');
+	my %fault = unreadable-entry(%fixture<kit>, 'target/nested/deep', 'locked.txt');
+	LEAVE { %fault<restore>() if %fault<restore>.defined }
+
+	my %result = call-tool(%fixture<server>, 'fs_move', {
+		from => 'source', to => 'target',
+	});
+	nok result-errored(%result), 'the completed move is a success';
+	is result-text(%result), "Moved 'source' to 'target'", 'the action text is preserved';
+	nok %fixture<root>.add('source').e, 'the source really moved';
+	ok %fixture<root>.add('target').d, 'the destination really exists';
+	is %fixture<root>.add('target/nested/deep/locked.txt').slurp,
+		'unreadable payload', 'the real destination contains the original bytes';
+	my %revisions = %result<result><structuredContent><revisions> // {};
+	is-deeply %revisions<from>,
+		{ state => 'absent', token => 'sha256-v1:absent' },
+		'the successful source revision is retained';
+	is (%revisions<to> // {})<state>, 'unknown', 'the failed destination revision is unknown';
+	nok (%revisions<to> // {})<token>:exists, 'no destination token is invented';
+	is %result<result><structuredContent><revisionScheme>, 'sha256-v1',
+		'the structured revision scheme survives';
+	is %fault<faults>(), 1, 'the real revision reader encountered the unreadable entry';
+};
+
+subtest 'list and stat keep their successful text when a descendant is unreadable' => {
+	plan 7;
+	my %fixture = fixture('observations');
+	LEAVE nuke(%fixture<root>);
+	make-tree(%fixture<root>, 'observed');
+	my $stat-text = result-text(call-tool(%fixture<server>, 'fs_stat', { path => 'observed' }));
+	my %fault = unreadable-entry(%fixture<kit>, 'observed/nested/deep', 'locked.txt');
+	LEAVE { %fault<restore>() if %fault<restore>.defined }
+
+	my %listed = call-tool(%fixture<server>, 'fs_list', { path => 'observed' });
+	nok result-errored(%listed), 'a successful list does not fail for revision metadata';
+	is result-text(%listed), 'nested/', 'the directory listing is preserved';
+	is-deeply (%listed<result><structuredContent><revisions><path> // {}),
+		{ state => 'unknown' }, 'the listing names an unknown revision without a token';
+	my %stat = call-tool(%fixture<server>, 'fs_stat', { path => 'observed' });
+	nok result-errored(%stat), 'a successful stat does not fail for revision metadata';
+	is result-text(%stat), $stat-text, 'the entire stat text is preserved';
+	is-deeply (%stat<result><structuredContent><revisions><path> // {}),
+		{ state => 'unknown' }, 'the stat revision is explicitly unknown';
+	is %fault<faults>(), 2, 'both actual revision traversals reached the unreadable entry';
+};
+
+subtest 'a failed pre-mutation file comparison stays fail-closed with a root-relative error' => {
+	plan 5;
+	my %fixture = fixture('compare-file');
+	LEAVE nuke(%fixture<root>);
+	my $deep = make-tree(%fixture<root>, 'source');
+	my %fault = unreadable-entry(%fixture<kit>, 'source/nested/deep', 'locked.txt');
+	LEAVE { %fault<restore>() if %fault<restore>.defined }
+
+	my %result = call-tool(%fixture<server>, 'fs_move', {
+		from => 'source', to => 'target',
+		'_expected-revisions' => { from => 'unused', to => 'sha256-v1:absent' },
+	});
+	ok result-errored(%result), 'a failed conditional comparison is an error';
+	ok result-text(%result).contains(
+		"Could not compute directory revision at 'source/nested/deep/locked.txt':"),
+		'the error names the complete root-relative file path';
+	ok $deep.add('locked.txt').e, 'the source was not mutated';
+	nok %fixture<root>.add('target').e, 'the destination was not created';
+	is %fault<faults>(), 1, 'the failure came from the revision reader';
+};
+
+subtest 'a failed directory enumeration names its root-relative location' => {
+	plan 5;
+	my %fixture = fixture('compare-directory');
+	LEAVE nuke(%fixture<root>);
+	make-tree(%fixture<root>, 'source');
+	my %fault = unreadable-directory(%fixture<kit>, 'source/nested/deep');
+	LEAVE { %fault<restore>() if %fault<restore>.defined }
+
+	my %result = call-tool(%fixture<server>, 'fs_delete', {
+		path => 'source', recursive => True,
+		'_expected-revisions' => { path => 'unused' },
+	});
+	ok result-errored(%result), 'the conditional delete fails closed';
+	ok result-text(%result).contains(
+		"Could not compute directory revision for 'source/nested/deep':"),
+		'the error names the complete root-relative directory';
+	ok %fixture<root>.add('source').d, 'the source directory remains';
+	ok %fixture<root>.add('source/nested/deep/locked.txt').e,
+		'the nested file remains';
+	is %fault<faults>(), 1, 'the failure came from directory enumeration';
+};
+
+subtest 'action failures remain errors without success metadata' => {
+	plan 4;
+	my %fixture = fixture('action-error');
+	LEAVE nuke(%fixture<root>);
+	my %result = call-tool(%fixture<server>, 'fs_move', {
+		from => 'missing', to => 'target',
+	});
+	ok result-errored(%result), 'the underlying action still fails';
+	is result-text(%result), "Path not found: 'missing'", 'the original action error is preserved';
+	nok (%result<result><structuredContent> // {})<revisionScheme>:exists,
+		'a failed action does not manufacture successful revision metadata';
+	nok %fixture<root>.add('target').e, 'the failed move creates no destination';
+};
+
+subtest 'a successful file read survives a revision-stage failure' => {
+	plan 3;
+	my %fixture = fixture('read');
+	LEAVE nuke(%fixture<root>);
+	%fixture<root>.add('note.txt').spurt('readable action bytes');
+	my $method = MCP::Server::Tool::FileSystem.^find_private_method('revision');
+	my $wrapper = $method.wrap(-> $self, Str:D $rel {
+		die 'synthetic revision-stage failure'
+			if $self === %fixture<kit> && $rel eq 'note.txt';
+		callsame;
+	});
+	LEAVE { $method.unwrap($wrapper) if $wrapper.defined }
+	my %result = call-tool(%fixture<server>, 'fs_read', { path => 'note.txt' });
+	nok result-errored(%result), 'the successful read stays successful';
+	is result-text(%result), 'readable action bytes', 'the read text is unchanged';
+	is-deeply (%result<result><structuredContent><revisions><path> // {}),
+		{ state => 'unknown' }, 'only its unavailable revision becomes unknown';
+};
+
+subtest 'successful byte and tree revision tokens remain unchanged' => {
+	plan 5;
+	my %fixture = fixture('tokens');
+	LEAVE nuke(%fixture<root>);
+	%fixture<root>.add('stable').mkdir;
+	%fixture<root>.add('stable/note.txt').spurt('alpha');
+	my $file-digest = sha256-hex('alpha'.encode('utf-8'));
+	my $tree-digest = sha256-hex("F:8:note.txt:5:$file-digest".encode('utf-8'));
+	my %read = call-tool(%fixture<server>, 'fs_read', { path => 'stable/note.txt' });
+	is %read<result><structuredContent><revisions><path><token>,
+		"sha256-v1:file:$file-digest", 'the byte token keeps its exact framing';
+	my %list = call-tool(%fixture<server>, 'fs_list', { path => 'stable' });
+	is %list<result><structuredContent><revisions><path><token>,
+		"sha256-v1:directory:$tree-digest", 'the tree token keeps its exact framing';
+	my %move = call-tool(%fixture<server>, 'fs_move', { from => 'stable', to => 'renamed' });
+	nok result-errored(%move), 'an ordinary move remains successful';
+	is %move<result><structuredContent><revisions><to><token>,
+		"sha256-v1:directory:$tree-digest", 'the requested path is not hashed into the tree token';
+	is-deeply %move<result><structuredContent><revisions><from>,
+		{ state => 'absent', token => 'sha256-v1:absent' }, 'the absent token remains unchanged';
+};

@@ -129,7 +129,9 @@ Ordering is untouched by any of this. A host that batches groups only **neighbou
 
 `read`, `list`, `stat` and every successful mutator keep their existing text content and additionally return `structuredContent` with `revisionScheme = sha256-v1`. Each location is `absent`, `file`, `directory`, or `symlink` with an opaque token. File tokens hash exact bytes; directory tokens hash a canonical, path-sorted recursive tree description, so a descendant change changes the directory revision.
 
-The five mutators accept a reserved `_expected-revisions` object keyed by `path`, or `from`/`to` for `move`. It is deliberately absent from the advertised schema: an orchestration layer adds it after the model creates the call. When present, every mutation location needs a token. Comparison and the mutation run under one toolkit mutation lock; a mismatch is an `isError` and does nothing. Calls without the reserved argument retain standalone behaviour.
+If revision calculation fails after an action succeeds, its text still returns. The affected location has `state = unknown` and no token. Other locations retain their successfully computed revisions. Clients must discard cached tokens for unknown revisions. A later successful observation can supply a fresh token.
+
+The five mutators accept a reserved `_expected-revisions` object keyed by `path`, or `from`/`to` for `move`. It is deliberately absent from the advertised schema: an orchestration layer adds it after the model creates the call. When present, every mutation location needs a token. Comparison and the mutation run under one toolkit mutation lock; a mismatch is an `isError` and does nothing. Calls without the reserved argument retain standalone behaviour. Revision errors during this comparison also fail before anything changes.
 
 ### read(path, offset?, limit?)
 

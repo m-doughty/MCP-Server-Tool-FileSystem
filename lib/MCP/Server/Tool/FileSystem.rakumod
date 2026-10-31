@@ -487,7 +487,14 @@ method !mutation-result(%args, @locations, &action --> Hash:D) {
 method !tool-result(Str:D $text, @locations --> Hash:D) {
 	my %revisions;
 	for @locations -> $location {
-		%revisions{$location.key} = self!revision($location.value.Str);
+		# The action already succeeded. Unavailable metadata must not
+		# turn that success into an error which invites a duplicate action.
+		my %revision = state => 'unknown';
+		{
+			CATCH { default { } }
+			%revision = self!revision($location.value.Str);
+		}
+		%revisions{$location.key} = %revision;
 	}
 	%(
 		content => [%( type => 'text', :$text ),],
@@ -518,7 +525,7 @@ method !revision(Str:D $rel --> Hash:D) {
 
 	if $path.d && !$path.l {
 		my @records;
-		self!revision-tree($path, '', @records);
+		self!revision-tree($path, '', @records, root-rel => $rel);
 		return %(
 			state => 'directory',
 			token => REVISION-SCHEME ~ ':directory:'
@@ -544,27 +551,34 @@ method !revision(Str:D $rel --> Hash:D) {
 	);
 }
 
-method !revision-tree(IO::Path:D $dir, Str:D $prefix, @records is raw --> Nil) {
+method !revision-tree(
+	IO::Path:D $dir, Str:D $prefix, @records is raw,
+	Str:D :$root-rel! --> Nil
+) {
+	my $relative-dir = $prefix.chars
+		?? ($root-rel eq '.' ?? $prefix !! "$root-rel/$prefix")
+		!! $root-rel;
 	my $entries = try $dir.dir.List;
-	die "Could not compute directory revision for '{$dir.basename}': {error-line($!)}"
+	die "Could not compute directory revision for '$relative-dir': {error-line($!)}"
 		without $entries;
 
 	for $entries.sort(*.basename) -> $entry {
 		my $name = $prefix.chars ?? "$prefix/{$entry.basename}" !! $entry.basename;
+		my $relative-name = $root-rel eq '.' ?? $name !! "$root-rel/$name";
 		my $framed = $name.encode('utf-8').bytes ~ ':' ~ $name ~ ':';
 		if $entry.l {
 			my $target = try nqp::readlink($entry.Str);
-			die "Could not compute directory revision at '$name': {error-line($!)}"
+			die "Could not compute directory revision at '$relative-name': {error-line($!)}"
 				without $target;
 			@records.push: 'L:' ~ $framed ~ sha256-hex($target.Str);
 		}
 		elsif $entry.d {
 			@records.push: 'D:' ~ $framed;
-			self!revision-tree($entry, $name, @records);
+			self!revision-tree($entry, $name, @records, :$root-rel);
 		}
 		elsif $entry.f {
 			my $bytes = try slurp-file-bytes($entry);
-			die "Could not compute directory revision at '$name': {error-line($!)}"
+			die "Could not compute directory revision at '$relative-name': {error-line($!)}"
 				without $bytes;
 			@records.push: 'F:' ~ $framed ~ $bytes.bytes ~ ':' ~ sha256-hex($bytes);
 		}

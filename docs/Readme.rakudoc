@@ -164,12 +164,19 @@ C<directory>, or C<symlink> with an opaque token. File tokens hash exact bytes;
 directory tokens hash a canonical, path-sorted recursive tree description, so
 a descendant change changes the directory revision.
 
+If revision calculation fails after an action succeeds, its text still returns.
+The affected location has C<state = unknown> and no token.
+Other locations retain their successfully computed revisions.
+Clients must discard cached tokens for unknown revisions.
+A later successful observation can supply a fresh token.
+
 The five mutators accept a reserved C<_expected-revisions> object keyed by
 C<path>, or C<from>/C<to> for C<move>. It is deliberately absent from the
 advertised schema: an orchestration layer adds it after the model creates the
 call. When present, every mutation location needs a token. Comparison and the
 mutation run under one toolkit mutation lock; a mismatch is an C<isError> and
 does nothing. Calls without the reserved argument retain standalone behaviour.
+Revision errors during this comparison also fail before anything changes.
 
 =head3 read(path, offset?, limit?)
 

@@ -2,6 +2,21 @@ Revision history for MCP::Server::Tool::FileSystem
 
 {{$NEXT}}
 
+0.3.1  2026-10-31T18:09:51Z
+    - BUGFIX: [2026-10-31] Successful actions retain their text when a
+      revision cannot be computed. Each unavailable location reports
+      state "unknown" without a token; other location revisions survive.
+      Conditional revision checks still fail before any mutation.
+      Directory revision errors now name the full root-relative path.
+    - BUGFIX: [2026-10-30] Read files through IO::Handle rather than
+      IO::Path.slurp(:bin), which dies with "Out of range: attempted to
+      read 0 bytes from filehandle" at exactly 1048576 bytes on Rakudo
+      2026.09. One boundary-sized file broke fs_stat and fs_list's
+      directory revision, was silently skipped by fs_grep and fs_map as
+      though unreadable, and surfaced to fs_read and fs_edit as a bogus
+      "not UTF-8" error. t/12-slurp-boundary.rakutest pins the boundary
+      from the tool side.
+
 0.3.0  2026-10-24T21:44:51+01:00
     - BUGFIX: [2026-10-24] Resolve configured roots directly with
       physical-path. On Windows, IO::Path.resolve could duplicate a junction
