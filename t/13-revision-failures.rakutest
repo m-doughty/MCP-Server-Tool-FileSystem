@@ -191,23 +191,29 @@ subtest 'action failures remain errors without success metadata' => {
 	nok %fixture<root>.add('target').e, 'the failed move creates no destination';
 };
 
-subtest 'a successful file read survives a revision-stage failure' => {
-	plan 3;
+subtest 'the post-action result boundary preserves real read text when revision I/O fails' => {
+	plan 5;
 	my %fixture = fixture('read');
 	LEAVE nuke(%fixture<root>);
 	%fixture<root>.add('note.txt').spurt('readable action bytes');
-	my $method = MCP::Server::Tool::FileSystem.^find_private_method('revision');
-	my $wrapper = $method.wrap(-> $self, Str:D $rel {
-		die 'synthetic revision-stage failure'
-			if $self === %fixture<kit> && $rel eq 'note.txt';
-		callsame;
-	});
-	LEAVE { $method.unwrap($wrapper) if $wrapper.defined }
-	my %result = call-tool(%fixture<server>, 'fs_read', { path => 'note.txt' });
-	nok result-errored(%result), 'the successful read stays successful';
-	is result-text(%result), 'readable action bytes', 'the read text is unchanged';
-	is-deeply (%result<result><structuredContent><revisions><path> // {}),
+	my %read = call-tool(%fixture<server>, 'fs_read', { path => 'note.txt' });
+	nok result-errored(%read), 'a real file read supplies the action text';
+	make-tree(%fixture<root>, 'unreadable');
+	my %fault = unreadable-entry(%fixture<kit>, 'unreadable/nested/deep', 'locked.txt');
+	LEAVE { %fault<restore>() if %fault<restore>.defined }
+
+	# Test the shared result boundary directly, using real read text and a
+	# real revision traversal. A runtime wrapper of a compiler-resolved
+	# private call is not a reliable fault seam on every supported compiler.
+	my &tool-result = MCP::Server::Tool::FileSystem.^find_private_method('tool-result');
+	my %result;
+	lives-ok {
+		%result = tool-result(%fixture<kit>, result-text(%read), ['path' => 'unreadable']);
+	}, 'a failed revision does not throw away the successful action result';
+	is %result<content>[0]<text>, 'readable action bytes', 'the read text is unchanged';
+	is-deeply (%result<structuredContent><revisions><path> // {}),
 		{ state => 'unknown' }, 'only its unavailable revision becomes unknown';
+	is %fault<faults>(), 1, 'the actual revision reader encountered the unreadable entry';
 };
 
 subtest 'successful byte and tree revision tokens remain unchanged' => {

@@ -2,6 +2,12 @@ Revision history for MCP::Server::Tool::FileSystem
 
 {{$NEXT}}
 
+0.3.2  2026-10-31T18:30:48Z
+    - MAINT: [2026-10-31] Make the revision-failure regression portable
+      across supported compilers. It tests the result boundary with real
+      read text and an unreadable-entry fixture, without wrapping a
+      compiler-resolved private revision call.
+
 0.3.1  2026-10-31T18:09:51Z
     - BUGFIX: [2026-10-31] Successful actions retain their text when a
       revision cannot be computed. Each unavailable location reports
